@@ -1,0 +1,26 @@
+# Python caches and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local virtual environments
+.env
+.venv/
+venv/
+
+# Frontend dependencies and build outputs
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+
+# Local generated evaluation artifacts
+runs/run_*/
+artifacts/
+
+# Local screenshots and UI review images
+image copy*.png
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
