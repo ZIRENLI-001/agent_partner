@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import hashlib
+from ipaddress import ip_address
 import threading
 import time
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 from urllib import request
 from urllib.parse import urlsplit
 
@@ -29,6 +30,14 @@ class JsonTransport(Protocol):
 
 
 class UrllibJsonTransport:
+    def __init__(
+        self,
+        opener: Callable[[request.Request, int], Any] | None = None,
+        max_response_bytes: int | None = None,
+    ):
+        self.opener = opener or request.build_opener(_NoRedirectHandler()).open
+        self.max_response_bytes = max_response_bytes
+
     def post_json(
         self,
         url: str,
@@ -38,8 +47,29 @@ class UrllibJsonTransport:
     ) -> dict[str, Any]:
         body = json.dumps(payload).encode("utf-8")
         req = request.Request(url=url, data=body, headers=headers, method="POST")
-        with request.urlopen(req, timeout=timeout_seconds) as response:
-            return json.loads(response.read().decode("utf-8"))
+        limit = (
+            self.max_response_bytes
+            if self.max_response_bytes is not None
+            else settings_from_env().model_response_max_bytes
+        )
+        with self.opener(req, timeout_seconds) as response:
+            response_body = response.read(limit + 1)
+        if len(response_body) > limit:
+            raise ValueError("Model provider response is too large")
+        return json.loads(response_body.decode("utf-8"))
+
+
+class _NoRedirectHandler(request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        request,
+        fp,
+        code,
+        msg,
+        headers,
+        newurl,
+    ):
+        return None
 
 
 class OpenAICompatibleProvider:
@@ -55,7 +85,7 @@ class OpenAICompatibleProvider:
             raise ValueError("api_base is required")
         if not config.model_name:
             raise ValueError("model_name is required")
-        _validate_api_base(api_base)
+        _validate_api_base(api_base, config.provider_type)
         payload = {
             "model": config.model_name,
             "messages": messages,
@@ -140,7 +170,8 @@ class OpenAICompatibleProvider:
                     break
                 if config.retry_backoff_seconds > 0:
                     time.sleep(config.retry_backoff_seconds * (attempt + 1))
-        assert last_exc is not None
+        if last_exc is None:
+            last_exc = RuntimeError("Model provider request did not run")
         safe_error = _redact_secret(str(last_exc), config.api_key)
         raise ModelProviderError(
             "Model provider request failed: %s" % safe_error,
@@ -163,7 +194,7 @@ def _extract_content(raw: dict[str, Any]) -> str:
     return content if isinstance(content, str) else ""
 
 
-def _validate_api_base(api_base: str) -> None:
+def _validate_api_base(api_base: str, provider_type: str = "") -> None:
     parsed = urlsplit(api_base)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ValueError("api_base must be an absolute HTTP(S) URL")
@@ -173,6 +204,19 @@ def _validate_api_base(api_base: str) -> None:
     allowed = settings_from_env().allowed_model_api_bases
     if api_base.rstrip("/") not in allowed:
         raise ValueError("api_base is not in ALLOWED_MODEL_API_BASES")
+    if (
+        settings_from_env().environment.lower() == "production"
+        and parsed.scheme != "https"
+    ):
+        raise ValueError("api_base must use HTTPS in production")
+    try:
+        address = ip_address(parsed.hostname)
+    except ValueError:
+        return
+    if not address.is_global and provider_type != "internal_gateway":
+        raise ValueError(
+            "private model addresses require the internal_gateway provider"
+        )
 
 
 def _redact_secret(message: str, secret: str) -> str:

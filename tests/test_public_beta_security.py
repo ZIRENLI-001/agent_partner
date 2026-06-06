@@ -8,6 +8,12 @@ from backend.eval_agent.api.main import create_app
 from backend.eval_agent.api.routes.runs import RunRequest
 from backend.eval_agent.core.config import settings_from_env
 from backend.eval_agent.core.security import trusted_client_ip
+from backend.eval_agent.providers.base import ModelConfig, ModelProviderError
+from backend.eval_agent.providers.openai_compatible import (
+    OpenAICompatibleProvider,
+    UrllibJsonTransport,
+    _NoRedirectHandler,
+)
 from backend.eval_agent.services.job_queue import JobQueueFull, JobQuotaExceeded
 from backend.eval_agent.services import health_service, run_service
 from backend.evaluation_engine import app as engine_app
@@ -299,3 +305,116 @@ def test_production_queue_errors_map_to_public_status_codes(
     assert response.status_code == expected_status
     assert response.json()["detail"] == expected_detail
     assert "internal" not in response.text
+
+
+def test_production_model_base_requires_https(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv(
+        "ALLOWED_MODEL_API_BASES",
+        "http://models.example.test/v1",
+    )
+    provider = OpenAICompatibleProvider(transport=SimpleNamespace())
+    config = ModelConfig(
+        provider_type="openai_compatible",
+        api_base="http://models.example.test/v1",
+        model_name="test-model",
+    )
+
+    with pytest.raises(ValueError, match="HTTPS"):
+        provider.generate([{"role": "user", "content": "hello"}], config)
+
+
+def test_private_model_base_requires_internal_gateway_provider(monkeypatch):
+    monkeypatch.setenv(
+        "ALLOWED_MODEL_API_BASES",
+        "https://127.0.0.1:8443/v1",
+    )
+    provider = OpenAICompatibleProvider(transport=SimpleNamespace())
+
+    with pytest.raises(ValueError, match="private"):
+        provider.generate(
+            [{"role": "user", "content": "hello"}],
+            ModelConfig(
+                provider_type="openai_compatible",
+                api_base="https://127.0.0.1:8443/v1",
+                model_name="test-model",
+            ),
+        )
+
+
+def test_internal_gateway_may_use_exact_allowlisted_private_base(monkeypatch):
+    class StaticTransport:
+        def post_json(self, url, headers, payload, timeout_seconds):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    monkeypatch.setenv(
+        "ALLOWED_MODEL_API_BASES",
+        "https://127.0.0.1:8443/v1",
+    )
+    provider = OpenAICompatibleProvider(transport=StaticTransport())
+
+    response = provider.generate(
+        [{"role": "user", "content": "hello"}],
+        ModelConfig(
+            provider_type="internal_gateway",
+            api_base="https://127.0.0.1:8443/v1",
+            model_name="test-model",
+        ),
+    )
+
+    assert response.content == "ok"
+
+
+def test_model_transport_rejects_redirects():
+    handler = _NoRedirectHandler()
+
+    assert (
+        handler.redirect_request(
+            request=SimpleNamespace(),
+            fp=None,
+            code=302,
+            msg="Found",
+            headers={},
+            newurl="https://evil.example/v1",
+        )
+        is None
+    )
+
+
+def test_model_response_body_is_bounded(monkeypatch):
+    class OversizedResponse:
+        def __init__(self):
+            self.read_size = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self, size):
+            self.read_size = size
+            return b"x" * size
+
+    response = OversizedResponse()
+    transport = UrllibJsonTransport(
+        opener=lambda request, timeout: response,
+        max_response_bytes=32,
+    )
+    provider = OpenAICompatibleProvider(transport=transport)
+    monkeypatch.setenv(
+        "ALLOWED_MODEL_API_BASES",
+        "https://models.example.test/v1",
+    )
+
+    with pytest.raises(ModelProviderError, match="too large"):
+        provider.generate(
+            [{"role": "user", "content": "hello"}],
+            ModelConfig(
+                provider_type="openai_compatible",
+                api_base="https://models.example.test/v1",
+                model_name="test-model",
+            ),
+        )
+
+    assert response.read_size == 33
