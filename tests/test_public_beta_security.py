@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from backend.eval_agent.api.main import create_app
 from backend.eval_agent.api.routes.runs import RunRequest
 from backend.eval_agent.core.config import settings_from_env
-from backend.eval_agent.services import run_service
+from backend.eval_agent.services import health_service, run_service
 from backend.evaluation_engine import app as engine_app
 
 
@@ -167,3 +167,63 @@ def test_production_adds_security_headers(monkeypatch, tmp_path):
     assert response.headers["x-frame-options"] == "DENY"
     assert response.headers["referrer-policy"] == "no-referrer"
     assert "default-src 'self'" in response.headers["content-security-policy"]
+
+
+def test_liveness_contains_no_dependency_details():
+    response = TestClient(create_app()).get("/api/health/live")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_production_readiness_fails_when_redis_is_unavailable(
+    monkeypatch,
+    tmp_path,
+):
+    frontend_dist = tmp_path / "frontend"
+    frontend_dist.mkdir()
+    (frontend_dist / "index.html").write_text("<html></html>", encoding="utf-8")
+    configure_production(monkeypatch, frontend_dist)
+    monkeypatch.setenv("EVAL_ARTIFACT_ROOT", str(tmp_path / "runs"))
+    monkeypatch.setattr(health_service, "redis_ready", lambda settings: False)
+
+    response = TestClient(create_app()).get("/api/health/ready")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "unavailable",
+        "checks": {
+            "configuration": "ok",
+            "redis": "unavailable",
+            "artifact_root": "ok",
+            "frontend": "ok",
+        },
+    }
+
+
+def test_production_readiness_reports_artifact_and_frontend_failures(
+    monkeypatch,
+    tmp_path,
+):
+    frontend_dist = tmp_path / "frontend"
+    frontend_dist.mkdir()
+    (frontend_dist / "index.html").write_text("<html></html>", encoding="utf-8")
+    configure_production(monkeypatch, frontend_dist)
+    monkeypatch.setattr(health_service, "redis_ready", lambda settings: True)
+    monkeypatch.setattr(
+        health_service,
+        "artifact_root_ready",
+        lambda settings: False,
+    )
+    monkeypatch.setattr(
+        health_service,
+        "frontend_ready",
+        lambda settings: False,
+    )
+
+    response = TestClient(create_app()).get("/api/health/ready")
+
+    assert response.status_code == 503
+    assert response.json()["checks"]["artifact_root"] == "unavailable"
+    assert response.json()["checks"]["frontend"] == "unavailable"
+    assert "paths" not in response.json()
