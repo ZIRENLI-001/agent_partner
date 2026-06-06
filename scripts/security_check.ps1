@@ -1,6 +1,7 @@
 $ErrorActionPreference = "Stop"
 
-python -m pytest -q
+$pytestTemp = Join-Path $env:TEMP "agent-partner-security-$PID"
+python -m pytest -q -p no:cacheprovider --basetemp="$pytestTemp"
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 Push-Location frontend
@@ -22,7 +23,7 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 git grep -n -I -E `
     "(BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|sk-[A-Za-z0-9]{20,}|APP_ACCESS_TOKEN=[A-Za-z0-9]{32,})" `
-    -- .
+    -- . ":(exclude)scripts/security_check.ps1" ":(exclude)scripts/security_check.sh"
 if ($LASTEXITCODE -eq 0) {
     throw "Potential tracked secret found."
 }
