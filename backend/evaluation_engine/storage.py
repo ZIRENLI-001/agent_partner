@@ -6,6 +6,8 @@ from typing import Iterable
 
 from pydantic import BaseModel
 
+from backend.eval_agent.storage.artifact_store import safe_run_dir
+
 
 class RunStore:
     def __init__(self, root: Path):
@@ -13,9 +15,7 @@ class RunStore:
         self.root.mkdir(parents=True, exist_ok=True)
 
     def run_dir(self, run_id: str) -> Path:
-        path = self.root / run_id
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+        return safe_run_dir(self.root, run_id, create=True)
 
     def write_model(self, run_id: str, filename: str, model: BaseModel) -> None:
         self.write_json(run_id, filename, model.model_dump(mode="json"))

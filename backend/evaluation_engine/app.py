@@ -8,6 +8,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from backend.eval_agent.storage.artifact_store import safe_run_dir
 from backend.evaluation_engine.engine import run_full_evaluation, summarize_input_data
 from backend.evaluation_engine.domain import (
     DialogueTrace,
@@ -227,7 +228,14 @@ def _run_history_payload(run_root: Path) -> dict[str, object]:
 
 
 def _run_detail_payload(run_root: Path, run_id: str) -> dict[str, object]:
-    run_dir = run_root / run_id
+    try:
+        run_dir = safe_run_dir(
+            run_root,
+            run_id,
+            require_generated_id=True,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Run not found") from exc
     if not run_dir.exists() or not run_dir.is_dir():
         raise HTTPException(status_code=404, detail="Run not found")
     try:

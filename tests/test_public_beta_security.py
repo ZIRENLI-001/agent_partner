@@ -1,8 +1,12 @@
 import pytest
+from fastapi import HTTPException
 from pydantic import ValidationError
+from types import SimpleNamespace
 
 from backend.eval_agent.api.routes.runs import RunRequest
 from backend.eval_agent.core.config import settings_from_env
+from backend.eval_agent.services import run_service
+from backend.evaluation_engine import app as engine_app
 
 
 def test_public_beta_settings_are_loaded(monkeypatch):
@@ -45,3 +49,34 @@ def test_public_beta_settings_are_loaded(monkeypatch):
 def test_run_request_rejects_oversized_fields(payload):
     with pytest.raises(ValidationError):
         RunRequest(**payload)
+
+
+def test_run_detail_rejects_windows_and_posix_path_traversal(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_service, "RUN_ROOT", tmp_path)
+    monkeypatch.setattr(
+        run_service,
+        "RUN_STATUS_STORE",
+        run_service.MemoryRunStatusStore(),
+    )
+    request = SimpleNamespace(
+        instruction="# Role\nAssistant\n# Task\nSay hello",
+        input_data="",
+        minimum_scenarios=1,
+        selected_scenario_ids=[],
+        workspace_id="workspace",
+        project_id="project",
+        created_by="tester",
+        eval_model_config=run_service.RuntimeModelConfig(provider="mock"),
+    )
+    created = run_service.create_run_payload(request)
+    nested = tmp_path / "nested"
+    nested.mkdir()
+
+    for run_id in (
+        "../%s" % created["run_id"],
+        "..\\%s" % created["run_id"],
+        "%s/extra" % created["run_id"],
+    ):
+        with pytest.raises(HTTPException) as exc:
+            engine_app._run_detail_payload(nested, run_id)
+        assert exc.value.status_code == 404
