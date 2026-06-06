@@ -4,6 +4,7 @@ from io import BytesIO
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
+import pytest
 from fastapi.testclient import TestClient
 
 from backend.eval_agent.api.main import create_app
@@ -137,7 +138,52 @@ def test_import_api_rejects_file_larger_than_configured_limit(monkeypatch):
     assert response.status_code == 413
 
 
-def build_minimal_xlsx() -> bytes:
+def test_xlsx_rejects_more_than_one_thousand_archive_entries():
+    buffer = BytesIO()
+    with ZipFile(buffer, "w", ZIP_DEFLATED) as archive:
+        for index in range(1_001):
+            archive.writestr(f"padding/{index}.xml", "<x/>")
+
+    with pytest.raises(ValueError, match="entries"):
+        parse_evaluation_rows("unsafe.xlsx", buffer.getvalue())
+
+
+def test_xlsx_rejects_relationship_target_outside_xl():
+    content = build_minimal_xlsx(sheet_target="../../outside.xml")
+
+    with pytest.raises(ValueError, match="relationship"):
+        parse_evaluation_rows("unsafe.xlsx", content)
+
+
+def test_csv_rejects_more_than_ten_thousand_rows():
+    content = ("instruction\n" + "hello\n" * 10_001).encode()
+
+    with pytest.raises(ValueError, match="rows"):
+        parse_evaluation_rows("large.csv", content)
+
+
+def test_csv_rejects_more_than_two_hundred_columns():
+    headers = ",".join(f"column_{index}" for index in range(201))
+    values = ",".join("value" for _ in range(201))
+
+    with pytest.raises(ValueError, match="columns"):
+        parse_evaluation_rows("wide.csv", f"{headers}\n{values}\n".encode())
+
+
+def test_xlsx_rejects_dtd_and_entity_declarations():
+    content = build_minimal_xlsx(
+        workbook_prefix='<!DOCTYPE workbook [<!ENTITY secret "unsafe">]>'
+    )
+
+    with pytest.raises(ValueError, match="XML"):
+        parse_evaluation_rows("unsafe.xlsx", content)
+
+
+def build_minimal_xlsx(
+    *,
+    sheet_target: str = "worksheets/sheet1.xml",
+    workbook_prefix: str = "",
+) -> bytes:
     buffer = BytesIO()
     with ZipFile(buffer, "w", ZIP_DEFLATED) as archive:
         archive.writestr(
@@ -160,16 +206,17 @@ def build_minimal_xlsx() -> bytes:
         )
         archive.writestr(
             "xl/workbook.xml",
-            """<?xml version="1.0" encoding="UTF-8"?>
+            f"""<?xml version="1.0" encoding="UTF-8"?>
+{workbook_prefix}
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
   <sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>
 </workbook>""",
         )
         archive.writestr(
             "xl/_rels/workbook.xml.rels",
-            """<?xml version="1.0" encoding="UTF-8"?>
+            f"""<?xml version="1.0" encoding="UTF-8"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="{sheet_target}"/>
   <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>
 </Relationships>""",
         )

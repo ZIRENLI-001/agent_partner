@@ -6,13 +6,21 @@ import re
 from io import BytesIO, StringIO
 from pathlib import PurePosixPath
 from typing import Any
-from xml.etree import ElementTree
+from xml.etree.ElementTree import Element as XmlElement
+from xml.etree.ElementTree import ParseError
 from zipfile import ZipFile
+
+from defusedxml import ElementTree
+from defusedxml.common import DefusedXmlException
 
 
 EvaluationRow = dict[str, str]
 MAX_XLSX_EXPANDED_BYTES = 50 * 1024 * 1024
 MAX_XLSX_ENTRY_BYTES = 20 * 1024 * 1024
+MAX_XLSX_ENTRIES = 1_000
+MAX_IMPORT_ROWS = 10_000
+MAX_IMPORT_COLUMNS = 200
+MAX_IMPORT_FIELD_CHARS = 1_000_000
 
 CASE_NAME_KEYS = [
     "case_name",
@@ -60,7 +68,14 @@ def parse_evaluation_rows(file_name: str, content: bytes) -> list[EvaluationRow]
 
 
 def _parse_tabular_rows(text: str, delimiter: str) -> list[EvaluationRow]:
-    rows = [row for row in csv.reader(StringIO(text), delimiter=delimiter) if any(cell.strip() for cell in row)]
+    rows: list[list[str]] = []
+    for row in csv.reader(StringIO(text), delimiter=delimiter):
+        if not any(cell.strip() for cell in row):
+            continue
+        _validate_tabular_row(row)
+        rows.append(row)
+        if len(rows) - 1 > MAX_IMPORT_ROWS:
+            raise ValueError("Import contains too many rows")
     if len(rows) < 2:
         return []
     headers = [cell.strip() for cell in rows[0]]
@@ -77,6 +92,10 @@ def _parse_json_rows(text: str) -> list[EvaluationRow]:
         rows = parsed.get("rows") or parsed.get("samples") or parsed.get("data") or [parsed]
     else:
         rows = []
+    if len(rows) > MAX_IMPORT_ROWS:
+        raise ValueError("Import contains too many rows")
+    if any(isinstance(row, dict) and len(row) > MAX_IMPORT_COLUMNS for row in rows):
+        raise ValueError("Import contains too many columns")
     return _filter_usable_rows(
         [_normalize_mapping(row, index) for index, row in enumerate(rows) if isinstance(row, dict)]
     )
@@ -86,8 +105,12 @@ def _parse_jsonl_rows(text: str) -> list[EvaluationRow]:
     rows: list[EvaluationRow] = []
     for index, line in enumerate(line.strip() for line in text.splitlines()):
         if line:
+            if len(rows) >= MAX_IMPORT_ROWS:
+                raise ValueError("Import contains too many rows")
             parsed = json.loads(line)
             if isinstance(parsed, dict):
+                if len(parsed) > MAX_IMPORT_COLUMNS:
+                    raise ValueError("Import contains too many columns")
                 rows.append(_normalize_mapping(parsed, index))
     return _filter_usable_rows(rows)
 
@@ -97,20 +120,29 @@ def _parse_xlsx_rows(content: bytes) -> list[EvaluationRow]:
         _validate_xlsx_archive(archive)
         shared_strings = _read_shared_strings(archive)
         sheet_path = _first_sheet_path(archive)
-        sheet_xml = ElementTree.fromstring(archive.read(sheet_path))
+        try:
+            sheet_xml = _parse_xml(archive.read(sheet_path))
+        except KeyError as exc:
+            raise ValueError("Excel relationship target is missing") from exc
 
     rows: list[list[str]] = []
     for row_node in sheet_xml.findall(".//{*}sheetData/{*}row"):
+        if len(rows) >= MAX_IMPORT_ROWS + 1:
+            raise ValueError("Import contains too many rows")
         values_by_column: dict[int, str] = {}
         for cell_node in row_node.findall("{*}c"):
             reference = cell_node.attrib.get("r", "")
             column_index = _column_index(reference)
             if column_index is None:
                 continue
+            if column_index >= MAX_IMPORT_COLUMNS:
+                raise ValueError("Import contains too many columns")
             values_by_column[column_index] = _read_cell_value(cell_node, shared_strings)
         if values_by_column:
             max_column = max(values_by_column)
-            rows.append([values_by_column.get(index, "") for index in range(max_column + 1)])
+            row = [values_by_column.get(index, "") for index in range(max_column + 1)]
+            _validate_tabular_row(row)
+            rows.append(row)
 
     if len(rows) < 2:
         return []
@@ -122,6 +154,8 @@ def _parse_xlsx_rows(content: bytes) -> list[EvaluationRow]:
 
 def _validate_xlsx_archive(archive: ZipFile) -> None:
     entries = archive.infolist()
+    if len(entries) > MAX_XLSX_ENTRIES:
+        raise ValueError("Excel archive contains too many entries")
     if any(entry.file_size > MAX_XLSX_ENTRY_BYTES for entry in entries):
         raise ValueError("Excel archive entry is too large")
     if sum(entry.file_size for entry in entries) > MAX_XLSX_EXPANDED_BYTES:
@@ -131,16 +165,18 @@ def _validate_xlsx_archive(archive: ZipFile) -> None:
 def _read_shared_strings(archive: ZipFile) -> list[str]:
     if "xl/sharedStrings.xml" not in archive.namelist():
         return []
-    root = ElementTree.fromstring(archive.read("xl/sharedStrings.xml"))
+    root = _parse_xml(archive.read("xl/sharedStrings.xml"))
     strings: list[str] = []
     for item in root.findall("{*}si"):
         text_parts = [node.text or "" for node in item.findall(".//{*}t")]
-        strings.append("".join(text_parts))
+        value = "".join(text_parts)
+        _validate_field(value)
+        strings.append(value)
     return strings
 
 
 def _first_sheet_path(archive: ZipFile) -> str:
-    workbook = ElementTree.fromstring(archive.read("xl/workbook.xml"))
+    workbook = _parse_xml(archive.read("xl/workbook.xml"))
     first_sheet = workbook.find(".//{*}sheet")
     if first_sheet is None:
         raise ValueError("Excel 文件中没有可读取的 sheet。")
@@ -150,15 +186,17 @@ def _first_sheet_path(archive: ZipFile) -> str:
     if not relationship_id:
         return "xl/worksheets/sheet1.xml"
 
-    relationships = ElementTree.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+    relationships = _parse_xml(archive.read("xl/_rels/workbook.xml.rels"))
     for relationship in relationships.findall("{*}Relationship"):
         if relationship.attrib.get("Id") == relationship_id:
+            if relationship.attrib.get("TargetMode", "").lower() == "external":
+                raise ValueError("Excel relationship target is not allowed")
             target = relationship.attrib.get("Target", "worksheets/sheet1.xml")
-            return str(PurePosixPath("xl") / target)
+            return _safe_xlsx_relationship_path(target)
     return "xl/worksheets/sheet1.xml"
 
 
-def _read_cell_value(cell_node: ElementTree.Element, shared_strings: list[str]) -> str:
+def _read_cell_value(cell_node: XmlElement, shared_strings: list[str]) -> str:
     value_node = cell_node.find("{*}v")
     inline_text = cell_node.find(".//{*}is/{*}t")
     if inline_text is not None:
@@ -170,6 +208,23 @@ def _read_cell_value(cell_node: ElementTree.Element, shared_strings: list[str]) 
         index = int(value)
         return shared_strings[index] if 0 <= index < len(shared_strings) else ""
     return value
+
+
+def _parse_xml(content: bytes) -> XmlElement:
+    try:
+        return ElementTree.fromstring(content)
+    except (DefusedXmlException, ParseError) as exc:
+        raise ValueError("Excel XML is not allowed") from exc
+
+
+def _safe_xlsx_relationship_path(target: str) -> str:
+    path = PurePosixPath(target.replace("\\", "/"))
+    if path.is_absolute() or ".." in path.parts:
+        raise ValueError("Excel relationship target is not allowed")
+    candidate = PurePosixPath("xl") / path
+    if not candidate.parts or candidate.parts[0] != "xl":
+        raise ValueError("Excel relationship target is not allowed")
+    return str(candidate)
 
 
 def _column_index(reference: str) -> int | None:
@@ -202,7 +257,9 @@ def _filter_usable_rows(rows: list[EvaluationRow]) -> list[EvaluationRow]:
 def _read_value(row: dict[str, Any], keys: list[str]) -> str:
     for key in keys:
         if key in row:
-            return _stringify(row[key])
+            value = _stringify(row[key])
+            _validate_field(value)
+            return value
     return ""
 
 
@@ -212,3 +269,15 @@ def _stringify(value: Any) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value, ensure_ascii=False, indent=2)
+
+
+def _validate_tabular_row(row: list[str]) -> None:
+    if len(row) > MAX_IMPORT_COLUMNS:
+        raise ValueError("Import contains too many columns")
+    for value in row:
+        _validate_field(value)
+
+
+def _validate_field(value: str) -> None:
+    if len(value) > MAX_IMPORT_FIELD_CHARS:
+        raise ValueError("Import field is too large")
