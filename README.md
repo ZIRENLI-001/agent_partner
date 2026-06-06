@@ -130,3 +130,27 @@ Do not copy local generated directories between developer machines:
 - `.pytest_cache/`
 
 Regenerate dependencies and builds with `make install` and `make build`.
+
+## Temporary Public Beta Deployment
+
+The temporary invited-test deployment is served at
+`https://163.7.11.194`. It uses a short-lived self-signed certificate, so
+browsers will show a certificate warning until the certificate is explicitly
+trusted.
+
+All business API requests require the shared `APP_ACCESS_TOKEN`. Treat this
+shared token as a password, distribute it only to invited testers, and rotate
+it by editing `/etc/agent-partner/agent-partner.env` followed by an API restart.
+The shared test environment also shares run history and artifacts between
+testers; do not submit sensitive production data.
+
+On a fresh Ubuntu 24.04 host, upload a clean source release below
+`/srv/agent_partner/releases/`, then run:
+
+```bash
+sudo ./deploy/bootstrap-ubuntu.sh
+sudo ./deploy/install-release.sh /srv/agent_partner/releases/<release>
+```
+
+Nginx is the only public service. FastAPI listens on `127.0.0.1:8070`, Redis
+listens on localhost only, and UFW permits only TCP ports 22, 80, and 443.

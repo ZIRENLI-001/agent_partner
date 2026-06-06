@@ -1,0 +1,26 @@
+[Unit]
+Description=Agent Partner evaluation worker %i
+After=network-online.target redis-server.service
+Wants=network-online.target
+Requires=redis-server.service
+
+[Service]
+Type=simple
+User=agent-partner
+Group=agent-partner
+WorkingDirectory=/srv/agent_partner/app
+EnvironmentFile=/etc/agent-partner/agent-partner.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/srv/agent_partner/app/.venv/bin/python -m backend.eval_agent.worker
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/agent_partner/runs
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target
