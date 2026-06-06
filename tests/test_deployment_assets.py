@@ -79,6 +79,7 @@ def test_systemd_services_run_unprivileged_and_are_hardened():
         assert "PrivateTmp=true" in service
         assert "ProtectSystem=strict" in service
         assert "ReadWritePaths=/srv/agent_partner/runs" in service
+        assert "Requires=redis-server.service" not in service
     assert "--host 127.0.0.1 --port 8070" in api
     assert "backend.eval_agent.worker" in worker
 
