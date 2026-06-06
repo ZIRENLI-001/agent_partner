@@ -9,6 +9,36 @@ export class ApiError extends Error {
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 900_000;
+const ACCESS_TOKEN_KEY = "dialogue-eval-access-token";
+
+export function accessTokenHeaders(): Record<string, string> {
+  const token = window.sessionStorage.getItem(ACCESS_TOKEN_KEY)?.trim();
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+export function promptForAccessToken(): boolean {
+  const token = window.prompt("请输入平台访问令牌")?.trim();
+  if (!token) return false;
+  window.sessionStorage.setItem(ACCESS_TOKEN_KEY, token);
+  return true;
+}
+
+async function fetchWithAccessToken(path: string, options: RequestInit): Promise<Response> {
+  const doFetch = () =>
+    fetch(path, {
+      ...options,
+      headers: {
+        ...(options.headers || {}),
+        ...accessTokenHeaders()
+      }
+    });
+
+  let response = await doFetch();
+  if (response.status === 401 && promptForAccessToken()) {
+    response = await doFetch();
+  }
+  return response;
+}
 
 export async function request<T>(
   path: string,
@@ -18,7 +48,7 @@ export async function request<T>(
   const timeout = window.setTimeout(() => controller.abort(), DEFAULT_REQUEST_TIMEOUT_MS);
   let response: Response;
   try {
-    response = await fetch(path, {
+    response = await fetchWithAccessToken(path, {
       headers: {
         "Content-Type": "application/json",
         ...(options.headers || {})

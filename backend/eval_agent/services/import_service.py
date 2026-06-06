@@ -11,6 +11,8 @@ from zipfile import ZipFile
 
 
 EvaluationRow = dict[str, str]
+MAX_XLSX_EXPANDED_BYTES = 50 * 1024 * 1024
+MAX_XLSX_ENTRY_BYTES = 20 * 1024 * 1024
 
 CASE_NAME_KEYS = [
     "case_name",
@@ -92,6 +94,7 @@ def _parse_jsonl_rows(text: str) -> list[EvaluationRow]:
 
 def _parse_xlsx_rows(content: bytes) -> list[EvaluationRow]:
     with ZipFile(BytesIO(content)) as archive:
+        _validate_xlsx_archive(archive)
         shared_strings = _read_shared_strings(archive)
         sheet_path = _first_sheet_path(archive)
         sheet_xml = ElementTree.fromstring(archive.read(sheet_path))
@@ -115,6 +118,14 @@ def _parse_xlsx_rows(content: bytes) -> list[EvaluationRow]:
     return _filter_usable_rows(
         [_normalize_mapping(dict(zip(headers, row)), index) for index, row in enumerate(rows[1:])]
     )
+
+
+def _validate_xlsx_archive(archive: ZipFile) -> None:
+    entries = archive.infolist()
+    if any(entry.file_size > MAX_XLSX_ENTRY_BYTES for entry in entries):
+        raise ValueError("Excel archive entry is too large")
+    if sum(entry.file_size for entry in entries) > MAX_XLSX_EXPANDED_BYTES:
+        raise ValueError("Excel archive expands beyond the allowed size")
 
 
 def _read_shared_strings(archive: ZipFile) -> list[str]:

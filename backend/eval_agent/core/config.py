@@ -34,6 +34,9 @@ class Settings:
     eval_scenario_generator_model: str = "openai/gpt-4.1-mini"
     eval_report_generator_model: str = "openai/gpt-4.1-mini"
     eval_instruction_parser_model: str = "openai/gpt-4.1-mini"
+    access_token: str = ""
+    allowed_model_api_bases: tuple[str, ...] = ("https://openrouter.ai/api/v1",)
+    max_upload_bytes: int = 10 * 1024 * 1024
 
 
 def project_root() -> Path:
@@ -75,6 +78,10 @@ def _env(name: str, default: str, dotenv: dict[str, str]) -> str:
     if value is not None:
         return value
     return dotenv.get(name, default)
+
+
+def _csv_values(value: str) -> tuple[str, ...]:
+    return tuple(item.strip().rstrip("/") for item in value.split(",") if item.strip())
 
 
 def settings_from_env() -> Settings:
@@ -126,4 +133,13 @@ def settings_from_env() -> Settings:
         eval_instruction_parser_model=_env(
             "EVAL_INSTRUCTION_PARSER_MODEL", "openai/gpt-4.1-mini", dotenv
         ),
+        access_token=_env("APP_ACCESS_TOKEN", "", dotenv),
+        allowed_model_api_bases=_csv_values(
+            _env(
+                "ALLOWED_MODEL_API_BASES",
+                "https://openrouter.ai/api/v1",
+                dotenv,
+            )
+        ),
+        max_upload_bytes=int(_env("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024), dotenv)),
     )

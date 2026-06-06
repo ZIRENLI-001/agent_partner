@@ -6,7 +6,9 @@ import threading
 import time
 from typing import Any, Protocol
 from urllib import request
+from urllib.parse import urlsplit
 
+from backend.eval_agent.core.config import settings_from_env
 from backend.eval_agent.providers.base import (
     Message,
     ModelConfig,
@@ -53,6 +55,7 @@ class OpenAICompatibleProvider:
             raise ValueError("api_base is required")
         if not config.model_name:
             raise ValueError("model_name is required")
+        _validate_api_base(api_base)
         payload = {
             "model": config.model_name,
             "messages": messages,
@@ -158,6 +161,18 @@ def _extract_content(raw: dict[str, Any]) -> str:
         return ""
     content = message.get("content", "")
     return content if isinstance(content, str) else ""
+
+
+def _validate_api_base(api_base: str) -> None:
+    parsed = urlsplit(api_base)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("api_base must be an absolute HTTP(S) URL")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("api_base must not contain credentials, query, or fragment")
+
+    allowed = settings_from_env().allowed_model_api_bases
+    if api_base.rstrip("/") not in allowed:
+        raise ValueError("api_base is not in ALLOWED_MODEL_API_BASES")
 
 
 def _redact_secret(message: str, secret: str) -> str:

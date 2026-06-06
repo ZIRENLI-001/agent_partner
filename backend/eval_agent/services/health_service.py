@@ -18,12 +18,14 @@ def health_payload() -> dict[str, object]:
     }
     status = "ok" if all(value in {"ok", "built", "fallback"} for value in checks.values()) else "degraded"
 
-    return {
+    payload: dict[str, object] = {
         "status": status,
         "checks": checks,
-        "paths": {
+    }
+    if settings.environment.lower() != "production":
+        payload["paths"] = {
             "artifact_root": str(artifact_root),
             "frontend_dist": str(frontend_dist),
             "calibration_dataset": str(DEFAULT_DATASET_PATH),
-        },
-    }
+        }
+    return payload

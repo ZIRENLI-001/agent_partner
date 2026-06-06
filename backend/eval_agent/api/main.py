@@ -8,13 +8,25 @@ from fastapi.staticfiles import StaticFiles
 
 from backend.eval_agent.api.routes import calibration, context, health, imports, runs, stages
 from backend.eval_agent.core.config import settings_from_env
+from backend.eval_agent.core.security import ApiTokenMiddleware
 from backend.evaluation_engine.app import WEB_INDEX
 
 FRONTEND_DIST = settings_from_env().frontend_dist
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="Dialogue Eval Platform")
+    settings = settings_from_env()
+    if settings.environment.lower() == "production" and not settings.access_token:
+        raise RuntimeError("APP_ACCESS_TOKEN is required when APP_ENV=production")
+
+    docs_enabled = settings.environment.lower() != "production"
+    app = FastAPI(
+        title="Dialogue Eval Platform",
+        docs_url="/docs" if docs_enabled else None,
+        redoc_url="/redoc" if docs_enabled else None,
+        openapi_url="/openapi.json" if docs_enabled else None,
+    )
+    app.add_middleware(ApiTokenMiddleware)
     app.include_router(calibration.router)
     app.include_router(context.router)
     app.include_router(health.router)
@@ -35,7 +47,10 @@ def create_app() -> FastAPI:
 
     @app.get("/{full_path:path}", response_class=HTMLResponse)
     def frontend_fallback(full_path: str) -> str:
-        if full_path.startswith("api/"):
+        if full_path.startswith("api/") or (
+            not docs_enabled
+            and full_path in {"docs", "redoc", "openapi.json"}
+        ):
             raise HTTPException(status_code=404, detail="Not found")
         return _frontend_index_html()
 

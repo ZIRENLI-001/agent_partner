@@ -125,6 +125,18 @@ def test_mock_evaluation_rows_api_uses_official_excel():
     assert "Course Publishing Platform" in payload["rows"][1]["instruction"]
 
 
+def test_import_api_rejects_file_larger_than_configured_limit(monkeypatch):
+    monkeypatch.setenv("MAX_UPLOAD_BYTES", "16")
+    client = TestClient(create_app())
+
+    response = client.post(
+        "/api/import/evaluation-rows",
+        files={"file": ("large.csv", b"x" * 17, "text/csv")},
+    )
+
+    assert response.status_code == 413
+
+
 def build_minimal_xlsx() -> bytes:
     buffer = BytesIO()
     with ZipFile(buffer, "w", ZIP_DEFLATED) as archive:

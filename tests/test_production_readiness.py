@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -7,6 +8,9 @@ from backend.eval_agent.api.main import create_app
 from backend.eval_agent.providers.base import ModelConfig, ModelProviderError
 from backend.eval_agent.providers.openai_compatible import OpenAICompatibleProvider
 from backend.eval_agent.storage.artifact_store import ArtifactStore
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class FailingTransport:
@@ -152,3 +156,73 @@ def test_production_api_keeps_unknown_api_paths_out_of_spa_fallback():
     response = client.get("/api/not-found")
 
     assert response.status_code == 404
+
+
+def test_api_access_token_protects_business_routes(monkeypatch):
+    monkeypatch.setenv("APP_ACCESS_TOKEN", "shared-test-token")
+    app = create_app()
+    client = TestClient(app)
+
+    unauthorized = client.get("/api/context")
+    authorized = client.get(
+        "/api/context",
+        headers={"Authorization": "Bearer shared-test-token"},
+    )
+    health = client.get("/api/health")
+
+    assert unauthorized.status_code == 401
+    assert authorized.status_code == 200
+    assert health.status_code == 200
+
+
+def test_production_requires_access_token(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.delenv("APP_ACCESS_TOKEN", raising=False)
+
+    with pytest.raises(RuntimeError, match="APP_ACCESS_TOKEN"):
+        create_app()
+
+
+def test_model_provider_rejects_api_base_outside_allowlist(monkeypatch):
+    monkeypatch.setenv(
+        "ALLOWED_MODEL_API_BASES",
+        "https://openrouter.ai/api/v1",
+    )
+    provider = OpenAICompatibleProvider(transport=CountingTransport())
+    config = ModelConfig(
+        provider_type="openai_compatible",
+        api_base="http://127.0.0.1:8080/v1",
+        model_name="internal-model",
+    )
+
+    with pytest.raises(ValueError, match="ALLOWED_MODEL_API_BASES"):
+        provider.generate([{"role": "user", "content": "hello"}], config)
+
+
+def test_production_health_does_not_expose_server_paths(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("APP_ACCESS_TOKEN", "shared-test-token")
+    app = create_app()
+    client = TestClient(app)
+
+    response = client.get("/api/health")
+
+    assert response.status_code == 200
+    assert "paths" not in response.json()
+
+
+def test_production_disables_api_documentation(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("APP_ACCESS_TOKEN", "shared-test-token")
+    app = create_app()
+    client = TestClient(app)
+
+    assert client.get("/docs").status_code == 404
+    assert client.get("/redoc").status_code == 404
+    assert client.get("/openapi.json").status_code == 404
+
+
+def test_gitignore_excludes_private_key_files():
+    gitignore = (PROJECT_ROOT / ".gitignore").read_text(encoding="utf-8")
+
+    assert "*.pem" in gitignore.splitlines()

@@ -63,6 +63,10 @@ Copy `.env.example` if your shell workflow sources environment files, or export 
 
 Important variables:
 
+- `APP_ENV`: set to `production` for public deployment
+- `APP_ACCESS_TOKEN`: required in production; shared Bearer token used to protect business APIs
+- `ALLOWED_MODEL_API_BASES`: comma-separated exact allowlist for model API base URLs
+- `MAX_UPLOAD_BYTES`: maximum uploaded file size, default 10 MiB
 - `HOST`: server host for `make dev`
 - `PORT`: server port for `make dev`
 - `EVAL_ARTIFACT_ROOT`: run artifact directory
@@ -92,6 +96,27 @@ Important variables:
 The default `mock` provider is suitable for local demos without network access. OpenRouter and self-hosted model gateways should use an OpenAI-compatible `/chat/completions` API.
 
 Frontend users only configure the target model being evaluated. Evaluation-chain models are controlled by backend environment variables. If `EVAL_CHAIN_API_KEY` is empty, the platform falls back to mock user simulation and heuristic judging so local demos remain runnable.
+
+## Public Beta Safety
+
+For an internet-facing test deployment, configure at least:
+
+```bash
+APP_ENV=production
+APP_ACCESS_TOKEN=<a-long-random-secret>
+ALLOWED_MODEL_API_BASES=https://openrouter.ai/api/v1
+MAX_UPLOAD_BYTES=10485760
+HOST=127.0.0.1
+```
+
+Put Nginx or Caddy in front of the service and expose only HTTPS ports `80/443`.
+Keep port `8070`, Redis, and any database bound to localhost or a private network.
+The frontend asks for `APP_ACCESS_TOKEN` after the first protected API request and
+stores it only in the current browser session.
+
+This shared token is suitable for a controlled beta, not full multi-user isolation.
+Do not allow untrusted users until per-user authentication, authorization, durable
+workers, and database-backed ownership checks are implemented.
 
 ## Deployment Notes
 
