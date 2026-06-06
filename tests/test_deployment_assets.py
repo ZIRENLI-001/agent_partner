@@ -118,6 +118,8 @@ def test_bootstrap_installs_host_dependencies_and_ip_certificate():
     assert "agent-partner" in script
     assert 'PUBLIC_IP="163.7.11.194"' in script
     assert "subjectAltName=IP:${PUBLIC_IP}" in script
+    assert "\nEOF\n" in script
+    assert "\n  EOF\n" not in script
     assert "ufw allow 22/tcp" in script
     assert "ufw allow 80/tcp" in script
     assert "ufw allow 443/tcp" in script
@@ -186,3 +188,13 @@ def test_frontend_uses_patched_vite_release():
     major, minor, patch = (int(part) for part in vite_version.split("."))
 
     assert (major, minor, patch) >= (6, 1, 0)
+
+
+def test_linux_deployment_files_use_lf_line_endings():
+    paths = [
+        PROJECT_ROOT / "deploy/bootstrap-ubuntu.sh",
+        PROJECT_ROOT / "deploy/install-release.sh",
+        PROJECT_ROOT / "scripts/security_check.sh",
+    ]
+
+    assert all(b"\r\n" not in path.read_bytes() for path in paths)
