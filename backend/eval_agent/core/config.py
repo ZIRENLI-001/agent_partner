@@ -37,6 +37,14 @@ class Settings:
     access_token: str = ""
     allowed_model_api_bases: tuple[str, ...] = ("https://openrouter.ai/api/v1",)
     max_upload_bytes: int = 10 * 1024 * 1024
+    max_json_body_bytes: int = 2 * 1024 * 1024
+    runs_per_ip_per_hour: int = 10
+    max_queued_runs: int = 10
+    run_job_timeout_seconds: int = 15 * 60
+    trusted_hosts: tuple[str, ...] = ("127.0.0.1", "localhost")
+    trusted_proxy_ips: tuple[str, ...] = ("127.0.0.1", "::1")
+    model_response_max_bytes: int = 10 * 1024 * 1024
+    artifact_retention_days: int = 7
 
 
 def project_root() -> Path:
@@ -142,4 +150,20 @@ def settings_from_env() -> Settings:
             )
         ),
         max_upload_bytes=int(_env("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024), dotenv)),
+        max_json_body_bytes=int(
+            _env("MAX_JSON_BODY_BYTES", str(2 * 1024 * 1024), dotenv)
+        ),
+        runs_per_ip_per_hour=int(_env("RUNS_PER_IP_PER_HOUR", "10", dotenv)),
+        max_queued_runs=int(_env("MAX_QUEUED_RUNS", "10", dotenv)),
+        run_job_timeout_seconds=int(_env("RUN_JOB_TIMEOUT_SECONDS", "900", dotenv)),
+        trusted_hosts=_csv_values(
+            _env("TRUSTED_HOSTS", "127.0.0.1,localhost", dotenv)
+        ),
+        trusted_proxy_ips=_csv_values(
+            _env("TRUSTED_PROXY_IPS", "127.0.0.1,::1", dotenv)
+        ),
+        model_response_max_bytes=int(
+            _env("MODEL_RESPONSE_MAX_BYTES", str(10 * 1024 * 1024), dotenv)
+        ),
+        artifact_retention_days=int(_env("ARTIFACT_RETENTION_DAYS", "7", dotenv)),
     )
