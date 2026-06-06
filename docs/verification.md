@@ -31,7 +31,7 @@
 
 ### Local Smoke Test
 
-- Server command: `python3 -m uvicorn backend.evaluation_engine.app:app --host 127.0.0.1 --port 8000`
+- Server command: `python3 -m uvicorn backend.eval_agent.api.main:app --host 127.0.0.1 --port 8070`
 - URL: `http://127.0.0.1:8000`
 - Latest smoke verification used `http://127.0.0.1:8010` because port `8000` was already occupied by another local service.
 - Latest production-editability smoke verification used `http://127.0.0.1:8040`.

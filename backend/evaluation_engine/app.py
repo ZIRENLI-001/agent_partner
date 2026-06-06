@@ -8,6 +8,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from backend.eval_agent.core.security import ApiTokenMiddleware
 from backend.eval_agent.storage.artifact_store import safe_run_dir
 from backend.evaluation_engine.engine import run_full_evaluation, summarize_input_data
 from backend.evaluation_engine.domain import (
@@ -37,6 +38,7 @@ from backend.evaluation_engine.scoring import (
 
 
 app = FastAPI(title="Dialogue Eval Platform")
+app.add_middleware(ApiTokenMiddleware)
 RUN_ROOT = Path("runs")
 WEB_INDEX = Path(__file__).parent / "web" / "index.html"
 

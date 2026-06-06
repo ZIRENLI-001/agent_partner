@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, status
+from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
 
+from backend.eval_agent.core.config import settings_from_env
 from backend.eval_agent.services.run_service import (
     create_run_payload,
     run_comparison_payload,
@@ -45,6 +46,8 @@ class RunRequest(BaseModel):
 
 @router.post("")
 def create_run(request: RunRequest) -> dict[str, object]:
+    if settings_from_env().environment.lower() == "production":
+        raise HTTPException(status_code=404, detail="Not found")
     return create_run_payload(request)
 
 

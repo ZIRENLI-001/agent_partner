@@ -199,9 +199,14 @@ def test_model_provider_rejects_api_base_outside_allowlist(monkeypatch):
         provider.generate([{"role": "user", "content": "hello"}], config)
 
 
-def test_production_health_does_not_expose_server_paths(monkeypatch):
+def test_production_health_does_not_expose_server_paths(monkeypatch, tmp_path):
+    frontend_dist = tmp_path / "frontend"
+    frontend_dist.mkdir()
+    (frontend_dist / "index.html").write_text("<html></html>", encoding="utf-8")
     monkeypatch.setenv("APP_ENV", "production")
     monkeypatch.setenv("APP_ACCESS_TOKEN", "shared-test-token")
+    monkeypatch.setenv("EVAL_FRONTEND_DIST", str(frontend_dist))
+    monkeypatch.setenv("TRUSTED_HOSTS", "testserver,localhost")
     app = create_app()
     client = TestClient(app)
 
@@ -211,9 +216,14 @@ def test_production_health_does_not_expose_server_paths(monkeypatch):
     assert "paths" not in response.json()
 
 
-def test_production_disables_api_documentation(monkeypatch):
+def test_production_disables_api_documentation(monkeypatch, tmp_path):
+    frontend_dist = tmp_path / "frontend"
+    frontend_dist.mkdir()
+    (frontend_dist / "index.html").write_text("<html></html>", encoding="utf-8")
     monkeypatch.setenv("APP_ENV", "production")
     monkeypatch.setenv("APP_ACCESS_TOKEN", "shared-test-token")
+    monkeypatch.setenv("EVAL_FRONTEND_DIST", str(frontend_dist))
+    monkeypatch.setenv("TRUSTED_HOSTS", "testserver,localhost")
     app = create_app()
     client = TestClient(app)
 
