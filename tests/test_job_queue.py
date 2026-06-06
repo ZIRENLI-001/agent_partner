@@ -10,6 +10,7 @@ from backend.eval_agent.services.job_queue import (
     JobQuotaExceeded,
     RedisJobQueue,
 )
+from backend.eval_agent.worker import process_next_job
 
 
 class FakeRedis:
@@ -187,3 +188,47 @@ def test_reconcile_requeues_processing_job_without_lease():
     assert redis.lists["eval:job:queue"] == ["run_deadbeef"]
     assert redis.lists["eval:job:processing"] == []
     assert queue.status("run_deadbeef")["status"] == "queued"
+
+
+def test_worker_completes_claimed_job_and_releases_sensitive_payload():
+    queue, redis = build_queue()
+    queue.submit(
+        "203.0.113.1",
+        "run_deadbeef",
+        {"instruction": "test", "api_key": "sk-secret"},
+    )
+    executed = []
+
+    processed = process_next_job(
+        queue,
+        lambda payload, run_id: executed.append((payload, run_id)),
+        claim_timeout_seconds=0,
+    )
+
+    assert processed is True
+    assert executed[0][1] == "run_deadbeef"
+    assert queue.status("run_deadbeef")["status"] == "completed"
+    assert not redis.exists("eval:job:payload:run_deadbeef")
+    assert redis.lists["eval:job:processing"] == []
+
+
+def test_worker_failure_uses_stable_public_error_without_secret():
+    queue, _ = build_queue()
+    queue.submit(
+        "203.0.113.1",
+        "run_deadbeef",
+        {"instruction": "test", "api_key": "sk-secret"},
+    )
+
+    process_next_job(
+        queue,
+        lambda payload, run_id: (_ for _ in ()).throw(
+            RuntimeError("provider rejected sk-secret")
+        ),
+        claim_timeout_seconds=0,
+    )
+
+    status = queue.status("run_deadbeef")
+    assert status["status"] == "failed"
+    assert status["error"] == "Evaluation failed"
+    assert "sk-secret" not in json.dumps(status)

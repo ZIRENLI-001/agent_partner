@@ -2,10 +2,16 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from backend.eval_agent.core.config import settings_from_env
+from backend.eval_agent.core.security import trusted_client_ip
+from backend.eval_agent.services.job_queue import (
+    JobQueueFull,
+    JobQueueUnavailable,
+    JobQuotaExceeded,
+)
 from backend.eval_agent.services.run_service import (
     create_run_payload,
     run_comparison_payload,
@@ -52,8 +58,21 @@ def create_run(request: RunRequest) -> dict[str, object]:
 
 
 @router.post("/async", status_code=status.HTTP_202_ACCEPTED)
-def submit_run(request: RunRequest) -> dict[str, object]:
-    return submit_run_payload(request)
+def submit_run(request: RunRequest, http_request: Request) -> dict[str, object]:
+    settings = settings_from_env()
+    source_ip = trusted_client_ip(http_request, settings.trusted_proxy_ips)
+    try:
+        return submit_run_payload(request, source_ip=source_ip)
+    except JobQuotaExceeded as exc:
+        raise HTTPException(
+            status_code=429,
+            detail="Hourly evaluation quota exceeded",
+        ) from exc
+    except (JobQueueFull, JobQueueUnavailable) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Evaluation queue is unavailable",
+        ) from exc
 
 
 @router.get("/history")

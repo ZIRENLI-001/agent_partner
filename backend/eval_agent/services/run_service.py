@@ -11,6 +11,10 @@ from backend.eval_agent.core.config import settings_from_env
 from backend.eval_agent.providers.base import ModelConfig as ProviderModelConfig
 from backend.eval_agent.providers.base import ModelProvider
 from backend.eval_agent.providers.openai_compatible import OpenAICompatibleProvider
+from backend.eval_agent.services.job_queue import (
+    JobQueueUnavailable,
+    RedisJobQueue,
+)
 from backend.evaluation_engine import app as engine_app
 from backend.evaluation_engine.domain import (
     DialogueTrace,
@@ -37,6 +41,7 @@ MOCK_PROVIDER_TYPES = {"", "mock"}
 REAL_PROVIDER_TYPES = {"openrouter", "openai_compatible", "internal_gateway"}
 RUN_ROOT: Path | None = None
 RUN_STATUS_STORE: Any | None = None
+JOB_QUEUE: RedisJobQueue | None = None
 ASYNC_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 STAGE_MODEL_ROLES = [
     "target_model",
@@ -524,8 +529,27 @@ def create_run_payload(request: Any) -> dict[str, object]:
     return engine_app._run_response_payload(result, summary, context)
 
 
-def submit_run_payload(request: Any) -> dict[str, object]:
+def submit_run_payload(
+    request: Any,
+    *,
+    source_ip: str = "",
+) -> dict[str, object]:
     run_id = _new_run_id()
+    settings = settings_from_env()
+    if settings.environment.lower() == "production":
+        queue = job_queue(require_redis=True)
+        if hasattr(request, "model_dump"):
+            payload = request.model_dump(mode="json", by_alias=True)
+        else:
+            payload = _request_payload(request)
+        queue.submit(source_ip or "unknown", run_id, payload)
+        return {
+            "run_id": run_id,
+            "status": "queued",
+            "status_url": "/api/runs/%s/status" % run_id,
+            "result_url": "/api/runs/%s" % run_id,
+        }
+
     status_store = run_status_store()
     if status_store is not None:
         status_store.set_status(
@@ -544,6 +568,28 @@ def submit_run_payload(request: Any) -> dict[str, object]:
 
 
 def _run_async_job(request: Any, run_id: str) -> None:
+    try:
+        _execute_run_job(request, run_id)
+    except Exception as exc:
+        status_store = run_status_store()
+        if status_store is not None:
+            status_store.set_status(
+                run_id,
+                status="failed",
+                current_stage="failed",
+                stages=_status_stages("failed", "failed"),
+                error=str(exc),
+            )
+
+
+def execute_queued_run(payload: dict[str, object], run_id: str) -> None:
+    from backend.eval_agent.api.routes.runs import RunRequest
+
+    request = RunRequest.model_validate(payload)
+    _execute_run_job(request, run_id)
+
+
+def _execute_run_job(request: Any, run_id: str) -> None:
     status_store = run_status_store()
     if status_store is not None:
         status_store.set_status(
@@ -556,47 +602,36 @@ def _run_async_job(request: Any, run_id: str) -> None:
     summary = model_config_summary(stage_configs["target_model"])
     stage_summary = stage_model_config_summary(stage_configs)
     context = run_context(request)
-    try:
-        run_full_evaluation(
-            run_id=run_id,
-            progress_callback=_progress_callback(status_store, run_id),
-            scenario_concurrency=settings_from_env().scenario_concurrency,
-            scenario_batch_size=settings_from_env().scenario_batch_size,
-            raw_instruction=request.instruction,
-            run_root=artifact_root(),
-            assistant_provider=build_assistant_provider(stage_configs["target_model"]),
-            user_provider=build_user_provider(stage_configs["user_simulator"]),
-            minimum_scenarios=request.minimum_scenarios,
-            input_data=request.input_data,
-            selected_scenario_ids=request.selected_scenario_ids,
-            model_config_summary=summary,
-            stage_model_config_summary=stage_summary,
-            run_context=context,
-            judge_provider=build_semantic_judge_provider(stage_configs["semantic_judge"]),
-            scenario_provider=build_scenario_generator_provider(
-                stage_configs["scenario_generator"]
-            ),
-            parser_provider=build_instruction_parser_provider(
-                stage_configs["instruction_parser"]
-            ),
-            rubric_provider=build_rubric_generator_provider(
-                stage_configs["rubric_generator"]
-            ),
-            report_provider=build_report_generator_provider(
-                stage_configs["report_generator"]
-            ),
-            quality_auto_repair=_quality_auto_repair_enabled(stage_configs),
-        )
-    except Exception as exc:
-        if status_store is not None:
-            status_store.set_status(
-                run_id,
-                status="failed",
-                current_stage="failed",
-                stages=_status_stages("failed", "failed"),
-                error=str(exc),
-            )
-        return
+    run_full_evaluation(
+        run_id=run_id,
+        progress_callback=_progress_callback(status_store, run_id),
+        scenario_concurrency=settings_from_env().scenario_concurrency,
+        scenario_batch_size=settings_from_env().scenario_batch_size,
+        raw_instruction=request.instruction,
+        run_root=artifact_root(),
+        assistant_provider=build_assistant_provider(stage_configs["target_model"]),
+        user_provider=build_user_provider(stage_configs["user_simulator"]),
+        minimum_scenarios=request.minimum_scenarios,
+        input_data=request.input_data,
+        selected_scenario_ids=request.selected_scenario_ids,
+        model_config_summary=summary,
+        stage_model_config_summary=stage_summary,
+        run_context=context,
+        judge_provider=build_semantic_judge_provider(stage_configs["semantic_judge"]),
+        scenario_provider=build_scenario_generator_provider(
+            stage_configs["scenario_generator"]
+        ),
+        parser_provider=build_instruction_parser_provider(
+            stage_configs["instruction_parser"]
+        ),
+        rubric_provider=build_rubric_generator_provider(
+            stage_configs["rubric_generator"]
+        ),
+        report_provider=build_report_generator_provider(
+            stage_configs["report_generator"]
+        ),
+        quality_auto_repair=_quality_auto_repair_enabled(stage_configs),
+    )
     if status_store is not None:
         status_store.set_status(
             run_id,
@@ -664,6 +699,54 @@ def run_status_store() -> Any:
         ttl_seconds=settings.run_status_ttl_seconds,
     )
     return RUN_STATUS_STORE
+
+
+def job_queue(*, require_redis: bool = False) -> RedisJobQueue:
+    global JOB_QUEUE
+    if JOB_QUEUE is not None:
+        return JOB_QUEUE
+    settings = settings_from_env()
+    try:
+        client = redis_client_from_url(settings.redis_url)
+        client.ping()
+    except Exception as exc:
+        if require_redis:
+            raise JobQueueUnavailable("Job queue is unavailable") from exc
+        raise
+    JOB_QUEUE = RedisJobQueue(
+        client,
+        runs_per_ip_per_hour=settings.runs_per_ip_per_hour,
+        max_queued_runs=settings.max_queued_runs,
+        job_timeout_seconds=settings.run_job_timeout_seconds,
+        status_ttl_seconds=settings.run_status_ttl_seconds,
+    )
+    return JOB_QUEUE
+
+
+def _request_payload(request: Any) -> dict[str, object]:
+    model_config = getattr(request, "eval_model_config", None)
+    return {
+        "instruction": getattr(request, "instruction", ""),
+        "input_data": getattr(request, "input_data", ""),
+        "minimum_scenarios": getattr(request, "minimum_scenarios", 5),
+        "model_config": {
+            "provider": getattr(model_config, "provider", "mock"),
+            "model_name": getattr(model_config, "model_name", ""),
+            "api_base": getattr(model_config, "api_base", ""),
+            "api_key": getattr(model_config, "api_key", ""),
+            "judge_mode": getattr(model_config, "judge_mode", "hybrid"),
+            "temperature": getattr(model_config, "temperature", None),
+            "max_tokens": getattr(model_config, "max_tokens", None),
+        },
+        "selected_scenario_ids": getattr(request, "selected_scenario_ids", []),
+        "workspace_id": getattr(request, "workspace_id", "workspace_demo"),
+        "project_id": getattr(
+            request,
+            "project_id",
+            "project_meituan_fulfillment",
+        ),
+        "created_by": getattr(request, "created_by", "demo_user"),
+    }
 
 
 def _new_run_id() -> str:

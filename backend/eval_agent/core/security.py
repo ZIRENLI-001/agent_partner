@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import secrets
+from ipaddress import ip_address
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -9,6 +10,23 @@ from starlette.responses import Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from backend.eval_agent.core.config import settings_from_env
+
+
+def trusted_client_ip(
+    request: Request,
+    trusted_proxy_ips: tuple[str, ...],
+) -> str:
+    peer = request.client.host if request.client else ""
+    if peer not in trusted_proxy_ips:
+        return peer
+    forwarded = request.headers.get("x-forwarded-for", "")
+    candidate = forwarded.split(",", 1)[0].strip()
+    if not candidate:
+        return peer
+    try:
+        return str(ip_address(candidate))
+    except ValueError:
+        return peer
 
 
 class ApiTokenMiddleware(BaseHTTPMiddleware):

@@ -1,5 +1,5 @@
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from types import SimpleNamespace
@@ -7,6 +7,8 @@ from types import SimpleNamespace
 from backend.eval_agent.api.main import create_app
 from backend.eval_agent.api.routes.runs import RunRequest
 from backend.eval_agent.core.config import settings_from_env
+from backend.eval_agent.core.security import trusted_client_ip
+from backend.eval_agent.services.job_queue import JobQueueFull, JobQuotaExceeded
 from backend.eval_agent.services import health_service, run_service
 from backend.evaluation_engine import app as engine_app
 
@@ -227,3 +229,73 @@ def test_production_readiness_reports_artifact_and_frontend_failures(
     assert response.json()["checks"]["artifact_root"] == "unavailable"
     assert response.json()["checks"]["frontend"] == "unavailable"
     assert "paths" not in response.json()
+
+
+def test_local_proxy_forwarded_ip_is_used():
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/runs/async",
+            "headers": [(b"x-forwarded-for", b"203.0.113.8")],
+            "client": ("127.0.0.1", 12345),
+        }
+    )
+
+    assert trusted_client_ip(request, ("127.0.0.1",)) == "203.0.113.8"
+
+
+def test_untrusted_peer_cannot_spoof_forwarded_ip():
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/runs/async",
+            "headers": [(b"x-forwarded-for", b"203.0.113.8")],
+            "client": ("198.51.100.4", 12345),
+        }
+    )
+
+    assert trusted_client_ip(request, ("127.0.0.1",)) == "198.51.100.4"
+
+
+@pytest.mark.parametrize(
+    ("queue_error", "expected_status", "expected_detail"),
+    [
+        (
+            JobQuotaExceeded("internal quota key failed"),
+            429,
+            "Hourly evaluation quota exceeded",
+        ),
+        (
+            JobQueueFull("internal queue length failed"),
+            503,
+            "Evaluation queue is unavailable",
+        ),
+    ],
+)
+def test_production_queue_errors_map_to_public_status_codes(
+    monkeypatch,
+    tmp_path,
+    queue_error,
+    expected_status,
+    expected_detail,
+):
+    class RejectingQueue:
+        def submit(self, source_ip, run_id, payload):
+            raise queue_error
+
+    frontend_dist = tmp_path / "frontend"
+    frontend_dist.mkdir()
+    (frontend_dist / "index.html").write_text("<html></html>", encoding="utf-8")
+    configure_production(monkeypatch, frontend_dist)
+    monkeypatch.setattr(run_service, "job_queue", lambda require_redis=False: RejectingQueue())
+
+    response = authorized_client(create_app()).post(
+        "/api/runs/async",
+        json={"instruction": "test"},
+    )
+
+    assert response.status_code == expected_status
+    assert response.json()["detail"] == expected_detail
+    assert "internal" not in response.text
