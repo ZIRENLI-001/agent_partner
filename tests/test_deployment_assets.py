@@ -141,6 +141,7 @@ def test_install_release_rejects_local_secrets_and_activates_atomically():
     assert "-m pytest" in script
     assert "ln -sfn" in script
     assert "/api/health/ready" in script
+    assert '"runs/run_*"' in script
 
 
 def test_readme_documents_temporary_public_beta_access():
@@ -163,6 +164,7 @@ def test_python_dependencies_are_exactly_locked():
     assert requirement_lines
     assert all("==" in line for line in requirement_lines)
     assert any(line.startswith("defusedxml==") for line in requirement_lines)
+    assert any(line.startswith("pytest==") for line in requirement_lines)
 
 
 def test_security_gate_scripts_cover_required_checks():

@@ -21,7 +21,8 @@ case "${RELEASE}" in
   *) echo "Release must be below ${APP_ROOT}/releases." >&2; exit 1 ;;
 esac
 
-for forbidden in ".env" "*.pem" "node_modules" "frontend/dist" "runs" ".git"; do
+for forbidden in \
+  ".env" "*.pem" "node_modules" "frontend/dist" "runs/run_*" ".git"; do
   if find "${RELEASE}" -path "*/${forbidden}" -print -quit | grep -q .; then
     echo "Release contains forbidden local content: ${forbidden}" >&2
     exit 1
