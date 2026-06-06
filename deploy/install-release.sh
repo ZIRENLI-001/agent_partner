@@ -34,8 +34,10 @@ test -f "${RELEASE}/frontend/package-lock.json"
 test -f "${CONFIG_ROOT}/agent-partner.env"
 
 python3 -m venv "${RELEASE}/.venv"
-"${RELEASE}/.venv/bin/python" -m pip install --upgrade pip
-"${RELEASE}/.venv/bin/python" -m pip install -r "${RELEASE}/requirements.lock"
+"${RELEASE}/.venv/bin/python" -m pip install \
+  --index-url https://pypi.org/simple --upgrade pip
+"${RELEASE}/.venv/bin/python" -m pip install \
+  --index-url https://pypi.org/simple -r "${RELEASE}/requirements.lock"
 npm ci --prefix "${RELEASE}/frontend"
 npm run build --prefix "${RELEASE}/frontend"
 

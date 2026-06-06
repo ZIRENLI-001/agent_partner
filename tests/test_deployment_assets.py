@@ -138,6 +138,7 @@ def test_install_release_rejects_local_secrets_and_activates_atomically():
     ):
         assert forbidden in script
     assert "requirements.lock" in script
+    assert "--index-url https://pypi.org/simple" in script
     assert "npm ci" in script
     assert "npm run build" in script
     assert "-m pytest" in script
