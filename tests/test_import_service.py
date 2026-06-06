@@ -5,10 +5,12 @@ from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
+from defusedxml.common import DefusedXmlException
 from fastapi.testclient import TestClient
 
 from backend.eval_agent.api.main import create_app
 from backend.eval_agent.services.import_service import parse_evaluation_rows
+from backend.evaluation_engine.sample_tasks import load_sample_tasks
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -177,6 +179,27 @@ def test_xlsx_rejects_dtd_and_entity_declarations():
 
     with pytest.raises(ValueError, match="XML"):
         parse_evaluation_rows("unsafe.xlsx", content)
+
+
+def test_sample_task_loader_rejects_dtd_and_entity_declarations(tmp_path):
+    workbook = tmp_path / "unsafe.xlsx"
+    with ZipFile(workbook, "w", ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "xl/sharedStrings.xml",
+            """<!DOCTYPE sst [<!ENTITY secret "unsafe">]>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <si><t>&secret;</t></si>
+</sst>""",
+        )
+        archive.writestr(
+            "xl/worksheets/sheet1.xml",
+            """<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData/>
+</worksheet>""",
+        )
+
+    with pytest.raises(DefusedXmlException):
+        load_sample_tasks(workbook)
 
 
 def build_minimal_xlsx(

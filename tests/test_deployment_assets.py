@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import json
 
 import pytest
 
@@ -149,3 +150,37 @@ def test_readme_documents_temporary_public_beta_access():
     assert "self-signed" in readme.lower()
     assert "APP_ACCESS_TOKEN" in readme
     assert "shared" in readme.lower()
+
+
+def test_python_dependencies_are_exactly_locked():
+    lock = _read("requirements.lock")
+    requirement_lines = [
+        line.strip()
+        for line in lock.splitlines()
+        if line.strip() and not line.lstrip().startswith(("#", "--"))
+    ]
+
+    assert requirement_lines
+    assert all("==" in line for line in requirement_lines)
+    assert any(line.startswith("defusedxml==") for line in requirement_lines)
+
+
+def test_security_gate_scripts_cover_required_checks():
+    powershell = _read("scripts/security_check.ps1")
+    bash = _read("scripts/security_check.sh")
+
+    for script in (powershell, bash):
+        assert "pytest" in script
+        assert "npm run build" in script
+        assert "pip-audit" in script
+        assert "npm audit --omit=dev" in script
+        assert "bandit -r backend -ll -iii" in script
+        assert "git grep" in script
+
+
+def test_frontend_uses_patched_vite_release():
+    package = json.loads(_read("frontend/package.json"))
+    vite_version = package["devDependencies"]["vite"].lstrip("^~")
+    major, minor, patch = (int(part) for part in vite_version.split("."))
+
+    assert (major, minor, patch) >= (6, 1, 0)

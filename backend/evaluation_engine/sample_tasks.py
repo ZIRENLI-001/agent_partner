@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+from defusedxml import ElementTree as ET
 from pathlib import Path
 from zipfile import ZipFile
-import xml.etree.ElementTree as ET
 
 
 SAMPLE_TASKS_PATH = Path("background/命题二：外呼任务对话模型指令示例.xlsx")
