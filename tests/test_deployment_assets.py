@@ -167,6 +167,7 @@ def test_python_dependencies_are_exactly_locked():
     assert requirement_lines
     assert all("==" in line for line in requirement_lines)
     assert any(line.startswith("defusedxml==") for line in requirement_lines)
+    assert any(line.startswith("httpx2==") for line in requirement_lines)
     assert any(line.startswith("pytest==") for line in requirement_lines)
 
 
