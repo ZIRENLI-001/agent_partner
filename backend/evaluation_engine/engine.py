@@ -241,6 +241,7 @@ def run_full_evaluation(
             assistant_provider=assistant_provider,
             user_provider=user_provider,
             judge_provider=judge_provider,
+            report_provider=report_provider,
             scenario_provider=scenario_provider,
             scenario_concurrency=scenario_concurrency,
             scenario_batch_size=scenario_batch_size,
@@ -255,6 +256,16 @@ def run_full_evaluation(
             "before_status": quality_summary.get("overall_status", "unknown"),
             "after_status": quality_summary.get("overall_status", "unknown"),
         }
+    _attach_model_call_diagnostics(
+        stage_diagnostics,
+        assistant_provider=assistant_provider,
+        user_provider=user_provider,
+        judge_provider=judge_provider,
+        scenario_provider=scenario_provider,
+        parser_provider=parser_provider,
+        rubric_provider=rubric_provider,
+        report_provider=report_provider,
+    )
     report.markdown = append_quality_summary_section(report.markdown, quality_summary)
 
     run_config_payload = run_config.model_dump(mode="json")
@@ -313,6 +324,7 @@ def _auto_repair_quality_once(
     assistant_provider: AssistantProvider,
     user_provider: UserProvider,
     judge_provider,
+    report_provider: ReportGeneratorProvider | None,
     scenario_provider: ScenarioGeneratorProvider | None,
     scenario_concurrency: int,
     scenario_batch_size: int | None,
@@ -373,14 +385,24 @@ def _auto_repair_quality_once(
         )
 
     if should_regenerate_report:
+        report_repair_started = time.perf_counter()
+        if report_provider is not None and hasattr(
+            report_provider,
+            "mark_next_model_call_as_retry",
+        ):
+            report_provider.mark_next_model_call_as_retry()
         report = write_report(
             run_id,
             task_spec,
             scenario_set,
             results,
             input_data_summary=input_data_summary,
-            report_provider=None,
+            report_provider=report_provider,
             stage_diagnostics=stage_diagnostics,
+        )
+        stage_timings_ms["report_generation"] = (
+            stage_timings_ms.get("report_generation", 0)
+            + _elapsed_ms(report_repair_started)
         )
 
     repaired_summary = build_quality_summary(
@@ -393,6 +415,36 @@ def _auto_repair_quality_once(
         stage_timings_ms=stage_timings_ms,
         stage_diagnostics=stage_diagnostics,
     )
+    if (
+        should_regenerate_report
+        and report_provider is not None
+        and repaired_summary["report_integrity"]["missing_sections"]
+    ):
+        report = write_markdown_report(
+            run_id,
+            task_spec,
+            scenario_set,
+            results,
+            input_data_summary=input_data_summary,
+        )
+        _record_stage_diagnostic(
+            stage_diagnostics,
+            "report_generation",
+            output_source="template_report",
+            model_attempted=True,
+            fallback_used=True,
+            fallback_reason="model report failed integrity check after retry",
+        )
+        repaired_summary = build_quality_summary(
+            task_spec=task_spec,
+            rubric=rubric,
+            scenario_set=scenario_set,
+            traces=traces,
+            results=results,
+            report_markdown=report.markdown,
+            stage_timings_ms=stage_timings_ms,
+            stage_diagnostics=stage_diagnostics,
+        )
     repaired_summary["auto_repair"] = {
         "attempted": True,
         "attempt_count": 1,
@@ -410,6 +462,50 @@ def _quality_repair_actions(quality_summary: dict[str, object]) -> list[dict[str
     if not isinstance(actions, list):
         return []
     return [action for action in actions if isinstance(action, dict)]
+
+
+def _attach_model_call_diagnostics(
+    stage_diagnostics: dict[str, dict[str, object]],
+    *,
+    assistant_provider,
+    user_provider,
+    judge_provider,
+    scenario_provider,
+    parser_provider,
+    rubric_provider,
+    report_provider,
+) -> None:
+    stage_providers = {
+        "instruction_parsing": parser_provider,
+        "rubric_generation": rubric_provider,
+        "scenario_generation": scenario_provider,
+        "report_generation": report_provider,
+    }
+    for stage_name, provider in stage_providers.items():
+        diagnostic = _provider_model_call_diagnostic(provider)
+        if diagnostic is not None:
+            stage_diagnostics.setdefault(stage_name, {})["model_call"] = diagnostic
+
+    execution_calls = {}
+    for role, provider in {
+        "target_model": assistant_provider,
+        "user_simulator": user_provider,
+        "semantic_judge": judge_provider,
+    }.items():
+        diagnostic = _provider_model_call_diagnostic(provider)
+        if diagnostic is not None:
+            execution_calls[role] = diagnostic
+    if execution_calls:
+        stage_diagnostics.setdefault("scenario_execution", {})[
+            "model_calls"
+        ] = execution_calls
+
+
+def _provider_model_call_diagnostic(provider) -> dict[str, object] | None:
+    if provider is None or not hasattr(provider, "model_call_diagnostic"):
+        return None
+    diagnostic = provider.model_call_diagnostic()
+    return diagnostic if isinstance(diagnostic, dict) else None
 
 
 def _timed_stage(

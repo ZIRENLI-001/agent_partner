@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from threading import Lock
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -65,6 +66,53 @@ class RuntimeModelConfig:
     max_tokens: Optional[int] = None
 
 
+class _ModelCallTracker:
+    def __init__(self, config: ProviderModelConfig):
+        self.config = config
+        self._lock = Lock()
+        self._prompt_ids: dict[str, int] = {}
+        self._model_call_count = 0
+        self._retry_count = 0
+        self._next_call_is_retry = False
+
+    def record(self, prompt_id: str, *, retry: bool = False) -> None:
+        with self._lock:
+            retry = retry or self._next_call_is_retry
+            self._next_call_is_retry = False
+            self._prompt_ids[prompt_id] = self._prompt_ids.get(prompt_id, 0) + 1
+            self._model_call_count += 1
+            if retry:
+                self._retry_count += 1
+
+    def mark_next_call_as_retry(self) -> None:
+        with self._lock:
+            self._next_call_is_retry = True
+
+    def summary(self) -> dict[str, object]:
+        with self._lock:
+            return {
+                "provider": self.config.provider_type,
+                "model_name": self.config.model_name,
+                "prompt_ids": dict(self._prompt_ids),
+                "model_call_count": self._model_call_count,
+                "retry_count": self._retry_count,
+            }
+
+
+class _TrackedModelAdapter:
+    def _init_model_call_tracker(self, config: ProviderModelConfig) -> None:
+        self._model_calls = _ModelCallTracker(config)
+
+    def _record_model_call(self, prompt_id: str, *, retry: bool = False) -> None:
+        self._model_calls.record(prompt_id, retry=retry)
+
+    def mark_next_model_call_as_retry(self) -> None:
+        self._model_calls.mark_next_call_as_retry()
+
+    def model_call_diagnostic(self) -> dict[str, object]:
+        return self._model_calls.summary()
+
+
 def model_config_summary(model_config: Any) -> dict[str, Any]:
     return engine_app._model_config_summary(model_config)
 
@@ -73,7 +121,7 @@ def run_context(request: Any) -> dict[str, object]:
     return engine_app._run_context(request)
 
 
-class AssistantModelAdapter:
+class AssistantModelAdapter(_TrackedModelAdapter):
     def __init__(
         self,
         config: ProviderModelConfig,
@@ -81,8 +129,10 @@ class AssistantModelAdapter:
     ):
         self.config = config
         self.model_provider = model_provider or OpenAICompatibleProvider()
+        self._init_model_call_tracker(config)
 
     def generate(self, task_spec: TaskSpec, history: list[Turn]) -> str:
+        self._record_model_call("target_dialogue_v1")
         response = self.model_provider.generate(
             [_system_message(task_spec)] + [_turn_message(turn) for turn in history],
             self.config,
@@ -90,7 +140,7 @@ class AssistantModelAdapter:
         return response.content
 
 
-class UserModelAdapter:
+class UserModelAdapter(_TrackedModelAdapter):
     def __init__(
         self,
         config: ProviderModelConfig,
@@ -98,8 +148,10 @@ class UserModelAdapter:
     ):
         self.config = config
         self.model_provider = model_provider or OpenAICompatibleProvider()
+        self._init_model_call_tracker(config)
 
     def generate(self, scenario: Scenario, history: list[Turn]) -> str:
+        self._record_model_call("user_simulator_v1")
         response = self.model_provider.generate(
             [_user_simulator_system_message(scenario)]
             + [_user_simulator_history_message(history)],
@@ -108,7 +160,7 @@ class UserModelAdapter:
         return _clean_model_text(response.content)
 
 
-class SemanticJudgeModelAdapter:
+class SemanticJudgeModelAdapter(_TrackedModelAdapter):
     def __init__(
         self,
         config: ProviderModelConfig,
@@ -116,8 +168,10 @@ class SemanticJudgeModelAdapter:
     ):
         self.config = config
         self.model_provider = model_provider or OpenAICompatibleProvider()
+        self._init_model_call_tracker(config)
 
     def judge(self, trace: DialogueTrace, item: RubricItem) -> EvidenceItem:
+        self._record_model_call("semantic_judge_single_v1")
         response = self.model_provider.generate(
             [
                 _semantic_judge_system_message(),
@@ -134,6 +188,7 @@ class SemanticJudgeModelAdapter:
     def judge_many(self, trace: DialogueTrace, items: list[RubricItem]) -> list[EvidenceItem]:
         if not items:
             return []
+        self._record_model_call("semantic_judge_batch_v1")
         response = self.model_provider.generate(
             [
                 _semantic_judge_system_message(batch=True),
@@ -183,7 +238,7 @@ class SemanticJudgeModelAdapter:
         ]
 
 
-class ModelScenarioGeneratorAdapter:
+class ModelScenarioGeneratorAdapter(_TrackedModelAdapter):
     def __init__(
         self,
         config: ProviderModelConfig,
@@ -191,6 +246,7 @@ class ModelScenarioGeneratorAdapter:
     ):
         self.config = config
         self.model_provider = model_provider or OpenAICompatibleProvider()
+        self._init_model_call_tracker(config)
 
     def generate(
         self,
@@ -199,26 +255,49 @@ class ModelScenarioGeneratorAdapter:
         input_data: str,
         minimum: int,
     ) -> ScenarioSet:
+        messages = [
+            _scenario_generator_system_message(),
+            {
+                "role": "user",
+                "content": _scenario_generator_user_message(
+                    task_spec,
+                    rubric,
+                    input_data,
+                    minimum,
+                ),
+            },
+        ]
+        self._record_model_call("scenario_generator_v1")
         response = self.model_provider.generate(
-            [
-                _scenario_generator_system_message(),
-                {
-                    "role": "user",
-                    "content": _scenario_generator_user_message(
-                        task_spec,
-                        rubric,
-                        input_data,
-                        minimum,
-                    ),
-                },
-            ],
+            messages,
             self.config,
         )
-        payload = _parse_json_object(response.content)
-        return _scenario_set_from_model_payload(payload, task_spec)
+        try:
+            payload = _parse_json_object(response.content)
+            return _scenario_set_from_model_payload(payload, task_spec)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            repair_config = replace(
+                self.config,
+                temperature=0,
+                max_tokens=max(6000, self.config.max_tokens),
+                cache_enabled=False,
+            )
+            repair_messages = messages + [
+                {"role": "assistant", "content": response.content},
+                {
+                    "role": "user",
+                    "content": _scenario_json_repair_message(exc),
+                },
+            ]
+            self._record_model_call(
+                "scenario_generator_json_repair_v1",
+                retry=True,
+            )
+            repaired = self.model_provider.generate(repair_messages, repair_config)
+            payload = _parse_json_object(repaired.content)
+            return _scenario_set_from_model_payload(payload, task_spec)
 
-
-class ModelInstructionParserAdapter:
+class ModelInstructionParserAdapter(_TrackedModelAdapter):
     def __init__(
         self,
         config: ProviderModelConfig,
@@ -226,6 +305,7 @@ class ModelInstructionParserAdapter:
     ):
         self.config = config
         self.model_provider = model_provider or OpenAICompatibleProvider()
+        self._init_model_call_tracker(config)
 
     def parse(
         self,
@@ -233,6 +313,7 @@ class ModelInstructionParserAdapter:
         task_id: str,
         input_data: str = "",
     ) -> TaskSpec:
+        self._record_model_call("instruction_parser_v1")
         response = self.model_provider.generate(
             [
                 _instruction_parser_system_message(),
@@ -255,7 +336,7 @@ class ModelInstructionParserAdapter:
         return TaskSpec(**payload)
 
 
-class ModelRubricGeneratorAdapter:
+class ModelRubricGeneratorAdapter(_TrackedModelAdapter):
     def __init__(
         self,
         config: ProviderModelConfig,
@@ -263,8 +344,10 @@ class ModelRubricGeneratorAdapter:
     ):
         self.config = config
         self.model_provider = model_provider or OpenAICompatibleProvider()
+        self._init_model_call_tracker(config)
 
     def build(self, task_spec: TaskSpec, raw_instruction: str) -> RubricSpec:
+        self._record_model_call("rubric_generator_v1")
         response = self.model_provider.generate(
             [
                 _rubric_generator_system_message(),
@@ -285,7 +368,7 @@ class ModelRubricGeneratorAdapter:
         return RubricSpec(**payload)
 
 
-class ModelReportGeneratorAdapter:
+class ModelReportGeneratorAdapter(_TrackedModelAdapter):
     def __init__(
         self,
         config: ProviderModelConfig,
@@ -293,6 +376,7 @@ class ModelReportGeneratorAdapter:
     ):
         self.config = config
         self.model_provider = model_provider or OpenAICompatibleProvider()
+        self._init_model_call_tracker(config)
 
     def write(
         self,
@@ -302,6 +386,7 @@ class ModelReportGeneratorAdapter:
         results: list[EvaluationResult],
         input_data_summary: dict[str, object],
     ) -> Report:
+        self._record_model_call("report_generator_v1")
         response = self.model_provider.generate(
             [
                 _report_generator_system_message(),
@@ -1104,7 +1189,8 @@ def _report_generator_system_message() -> dict[str, str]:
         "content": (
             "你是复杂指令多轮对话评测系统的报告撰写器。"
             "输出中文Markdown报告。不得改写输入中的量化分数、通过率、失败项数量。"
-            "报告必须包含阶段概览、关键失败、证据链、风险分层和可落地优化建议。"
+            "报告必须使用二级标题“## 量化结果”和“## 证据链”，"
+            "并包含阶段概览、关键失败、风险分层和可落地优化建议。"
             "如evidence_compaction显示有遗漏证据，必须说明遗漏证据数量，不得补写未提供的对话。"
         ),
     }
@@ -1199,7 +1285,9 @@ def _report_generator_user_message(
             "instruction": "基于以下不可更改的量化结果，生成解释性Markdown报告。",
             "report_requirements": [
                 "不得改写locked_metrics中的任何数值",
-                "包含阶段概览、关键失败、证据链、风险分层和下一步优化建议",
+                "必须原样包含二级标题：## 量化结果",
+                "必须原样包含二级标题：## 证据链",
+                "包含阶段概览、关键失败、风险分层和下一步优化建议",
                 "引用证据时仅使用EvaluationResults中提供的内容",
                 "如存在omitted_evidence_items，说明遗漏证据数量和报告局限",
             ],
@@ -1304,6 +1392,20 @@ def _scenario_generator_user_message(
             "TaskSpec": task_spec.model_dump(mode="json"),
             "Rubric": rubric.model_dump(mode="json"),
             "input_data": input_data,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _scenario_json_repair_message(error: Exception) -> str:
+    return json.dumps(
+        {
+            "instruction": (
+                "上一个回答不是合法、完整的JSON。请根据前文要求重新生成完整结果，"
+                "只输出一个JSON对象，不要解释，不要使用Markdown代码块。"
+            ),
+            "parse_error": "%s: %s" % (type(error).__name__, str(error)),
+            "required_root_field": "scenarios",
         },
         ensure_ascii=False,
     )

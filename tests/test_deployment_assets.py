@@ -66,6 +66,10 @@ def test_nginx_limits_tls_and_security_headers_are_configured():
     assert "client_max_body_size 10m" in config
     assert "limit_req_zone" in config
     assert "limit_req zone=agent_partner_api" in config
+    assert "zone=agent_partner_status:10m rate=120r/m" in config
+    assert "limit_req zone=agent_partner_status" in config
+    assert "limit_req_status 429" in config
+    assert 'location ~ "^/api/runs/run_[0-9a-f]{8}/status$"' in config
     assert "proxy_pass http://127.0.0.1:8070" in config
     assert "proxy_set_header X-Forwarded-For $remote_addr" in config
     assert "Content-Security-Policy" in config
