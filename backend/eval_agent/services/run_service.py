@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Lock
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from uuid import uuid4
 
 from backend.eval_agent.core.config import settings_from_env
@@ -111,6 +111,44 @@ class _TrackedModelAdapter:
 
     def model_call_diagnostic(self) -> dict[str, object]:
         return self._model_calls.summary()
+
+    def _generate_structured_response(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        prompt_id: str,
+        repair_prompt_id: str,
+        repair_stage: str,
+        minimum_repair_tokens: int,
+        parse_response: Callable[[str], Any],
+    ) -> Any:
+        self._record_model_call(prompt_id)
+        response = self.model_provider.generate(messages, self.config)
+        try:
+            return parse_response(response.content)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            repair_config = replace(
+                self.config,
+                temperature=0,
+                max_tokens=max(
+                    minimum_repair_tokens,
+                    int(self.config.max_tokens or 0),
+                ),
+                cache_enabled=False,
+            )
+            repair_messages = messages + [
+                {"role": "assistant", "content": response.content},
+                {
+                    "role": "user",
+                    "content": _structured_json_repair_message(
+                        repair_stage,
+                        exc,
+                    ),
+                },
+            ]
+            self._record_model_call(repair_prompt_id, retry=True)
+            repaired = self.model_provider.generate(repair_messages, repair_config)
+            return parse_response(repaired.content)
 
 
 def model_config_summary(model_config: Any) -> dict[str, Any]:
@@ -267,35 +305,18 @@ class ModelScenarioGeneratorAdapter(_TrackedModelAdapter):
                 ),
             },
         ]
-        self._record_model_call("scenario_generator_v1")
-        response = self.model_provider.generate(
-            messages,
-            self.config,
+        def parse_response(content: str) -> ScenarioSet:
+            payload = _parse_json_object(content)
+            return _scenario_set_from_model_payload(payload, task_spec)
+
+        return self._generate_structured_response(
+            messages=messages,
+            prompt_id="scenario_generator_v1",
+            repair_prompt_id="scenario_generator_json_repair_v1",
+            repair_stage="scenario_generator",
+            minimum_repair_tokens=6000,
+            parse_response=parse_response,
         )
-        try:
-            payload = _parse_json_object(response.content)
-            return _scenario_set_from_model_payload(payload, task_spec)
-        except (json.JSONDecodeError, TypeError, ValueError) as exc:
-            repair_config = replace(
-                self.config,
-                temperature=0,
-                max_tokens=max(6000, self.config.max_tokens),
-                cache_enabled=False,
-            )
-            repair_messages = messages + [
-                {"role": "assistant", "content": response.content},
-                {
-                    "role": "user",
-                    "content": _scenario_json_repair_message(exc),
-                },
-            ]
-            self._record_model_call(
-                "scenario_generator_json_repair_v1",
-                retry=True,
-            )
-            repaired = self.model_provider.generate(repair_messages, repair_config)
-            payload = _parse_json_object(repaired.content)
-            return _scenario_set_from_model_payload(payload, task_spec)
 
 class ModelInstructionParserAdapter(_TrackedModelAdapter):
     def __init__(
@@ -313,27 +334,34 @@ class ModelInstructionParserAdapter(_TrackedModelAdapter):
         task_id: str,
         input_data: str = "",
     ) -> TaskSpec:
-        self._record_model_call("instruction_parser_v1")
-        response = self.model_provider.generate(
-            [
-                _instruction_parser_system_message(),
-                {
-                    "role": "user",
-                    "content": _instruction_parser_user_message(
-                        raw_instruction,
-                        task_id,
-                        input_data=input_data,
-                    ),
-                },
-            ],
-            self.config,
+        messages = [
+            _instruction_parser_system_message(),
+            {
+                "role": "user",
+                "content": _instruction_parser_user_message(
+                    raw_instruction,
+                    task_id,
+                    input_data=input_data,
+                ),
+            },
+        ]
+
+        def parse_response(content: str) -> TaskSpec:
+            payload = _parse_json_object(content)
+            payload = payload.get("task_spec", payload)
+            if not isinstance(payload, dict):
+                raise ValueError("instruction parser output is not an object")
+            payload["task_id"] = task_id
+            return TaskSpec(**payload)
+
+        return self._generate_structured_response(
+            messages=messages,
+            prompt_id="instruction_parser_v1",
+            repair_prompt_id="instruction_parser_json_repair_v1",
+            repair_stage="instruction_parser",
+            minimum_repair_tokens=3000,
+            parse_response=parse_response,
         )
-        payload = _parse_json_object(response.content)
-        payload = payload.get("task_spec", payload)
-        if not isinstance(payload, dict):
-            raise ValueError("instruction parser output is not an object")
-        payload["task_id"] = task_id
-        return TaskSpec(**payload)
 
 
 class ModelRubricGeneratorAdapter(_TrackedModelAdapter):
@@ -347,25 +375,32 @@ class ModelRubricGeneratorAdapter(_TrackedModelAdapter):
         self._init_model_call_tracker(config)
 
     def build(self, task_spec: TaskSpec, raw_instruction: str) -> RubricSpec:
-        self._record_model_call("rubric_generator_v1")
-        response = self.model_provider.generate(
-            [
-                _rubric_generator_system_message(),
-                {
-                    "role": "user",
-                    "content": _rubric_generator_user_message(task_spec, raw_instruction),
-                },
-            ],
-            self.config,
+        messages = [
+            _rubric_generator_system_message(),
+            {
+                "role": "user",
+                "content": _rubric_generator_user_message(task_spec, raw_instruction),
+            },
+        ]
+
+        def parse_response(content: str) -> RubricSpec:
+            payload = _parse_json_object(content)
+            payload = payload.get("rubric_spec", payload)
+            if not isinstance(payload, dict):
+                raise ValueError("rubric generator output is not an object")
+            payload["task_id"] = task_spec.task_id
+            payload.setdefault("rubric_id", "%s_rubric" % task_spec.task_id)
+            payload.setdefault("version", task_spec.version)
+            return RubricSpec(**payload)
+
+        return self._generate_structured_response(
+            messages=messages,
+            prompt_id="rubric_generator_v1",
+            repair_prompt_id="rubric_generator_json_repair_v1",
+            repair_stage="rubric_generator",
+            minimum_repair_tokens=6000,
+            parse_response=parse_response,
         )
-        payload = _parse_json_object(response.content)
-        payload = payload.get("rubric_spec", payload)
-        if not isinstance(payload, dict):
-            raise ValueError("rubric generator output is not an object")
-        payload["task_id"] = task_spec.task_id
-        payload.setdefault("rubric_id", "%s_rubric" % task_spec.task_id)
-        payload.setdefault("version", task_spec.version)
-        return RubricSpec(**payload)
 
 
 class ModelReportGeneratorAdapter(_TrackedModelAdapter):
@@ -1397,15 +1432,15 @@ def _scenario_generator_user_message(
     )
 
 
-def _scenario_json_repair_message(error: Exception) -> str:
+def _structured_json_repair_message(stage: str, error: Exception) -> str:
     return json.dumps(
         {
             "instruction": (
                 "上一个回答不是合法、完整的JSON。请根据前文要求重新生成完整结果，"
                 "只输出一个JSON对象，不要解释，不要使用Markdown代码块。"
             ),
+            "stage": stage,
             "parse_error": "%s: %s" % (type(error).__name__, str(error)),
-            "required_root_field": "scenarios",
         },
         ensure_ascii=False,
     )

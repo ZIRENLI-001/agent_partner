@@ -397,6 +397,132 @@ def test_scenario_adapter_retries_malformed_json_with_same_model():
     assert diagnostic["retry_count"] == 1
 
 
+def test_instruction_parser_retries_malformed_json_with_same_model():
+    from backend.eval_agent.api.routes.runs import ModelConfig
+    from backend.eval_agent.services.run_service import build_instruction_parser_provider
+
+    class SequentialModelProvider:
+        def __init__(self):
+            self.responses = [
+                '{"task_id":"task_001","task_name":"truncated"',
+                json.dumps(
+                    {
+                        "task_id": "task_001",
+                        "version": "v1",
+                        "task_name": "合同通知",
+                        "role": "合同通知专员",
+                        "target_user": "用户",
+                        "task_goal": "告知合同已生效",
+                        "opening_line": "您好",
+                        "required_steps": ["告知合同生效", "确认用户理解"],
+                        "constraints": ["不得虚构合同条款"],
+                        "faq": [],
+                        "edge_cases": [],
+                        "forbidden_actions": ["虚构合同条款"],
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+            self.calls = []
+
+        def generate(self, messages, config):
+            self.calls.append({"messages": messages, "config": config})
+            return ModelResponse(content=self.responses.pop(0), raw={"ok": True})
+
+    model = SequentialModelProvider()
+    adapter = build_instruction_parser_provider(
+        ModelConfig(
+            provider="openrouter",
+            model_name="anthropic/claude-opus-4.6",
+            api_base="https://openrouter.ai/api/v1",
+            api_key="sk-parser",
+        ),
+        model_provider=model,
+    )
+
+    task = adapter.parse(
+        "# Role\n你是合同通知专员。\n# Task\n告知用户合同已生效。",
+        task_id="task_001",
+    )
+
+    assert task.task_name == "合同通知"
+    assert len(model.calls) == 2
+    assert model.calls[1]["config"].model_name == "anthropic/claude-opus-4.6"
+    assert model.calls[1]["config"].temperature == 0
+    assert model.calls[1]["config"].max_tokens >= 3000
+    assert model.calls[1]["config"].cache_enabled is False
+    assert adapter.model_call_diagnostic()["prompt_ids"] == {
+        "instruction_parser_v1": 1,
+        "instruction_parser_json_repair_v1": 1,
+    }
+    assert adapter.model_call_diagnostic()["retry_count"] == 1
+
+
+def test_rubric_generator_retries_malformed_json_with_same_model():
+    from backend.eval_agent.api.routes.runs import ModelConfig
+    from backend.eval_agent.services.run_service import build_rubric_generator_provider
+    from backend.evaluation_engine.instruction_parser import parse_instruction
+
+    class SequentialModelProvider:
+        def __init__(self):
+            self.responses = [
+                '{"rubric_id":"task_001_rubric","items":[{"item_id":"truncated"',
+                json.dumps(
+                    {
+                        "rubric_id": "task_001_rubric",
+                        "task_id": "task_001",
+                        "version": "v1",
+                        "items": [
+                            {
+                                "item_id": "step_01",
+                                "dimension": "task_completion",
+                                "criterion": "告知用户合同已生效",
+                                "source": "Task",
+                                "check_type": "semantic",
+                                "weight": 10,
+                                "critical": False,
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+            self.calls = []
+
+        def generate(self, messages, config):
+            self.calls.append({"messages": messages, "config": config})
+            return ModelResponse(content=self.responses.pop(0), raw={"ok": True})
+
+    model = SequentialModelProvider()
+    adapter = build_rubric_generator_provider(
+        ModelConfig(
+            provider="openrouter",
+            model_name="anthropic/claude-opus-4.6",
+            api_base="https://openrouter.ai/api/v1",
+            api_key="sk-rubric",
+        ),
+        model_provider=model,
+    )
+    task = parse_instruction(
+        "# Role\n你是合同通知专员。\n# Task\n告知用户合同已生效。",
+        task_id="task_001",
+    )
+
+    rubric = adapter.build(task, "# Task\n告知用户合同已生效。")
+
+    assert rubric.items[0].criterion == "告知用户合同已生效"
+    assert len(model.calls) == 2
+    assert model.calls[1]["config"].model_name == "anthropic/claude-opus-4.6"
+    assert model.calls[1]["config"].temperature == 0
+    assert model.calls[1]["config"].max_tokens >= 6000
+    assert model.calls[1]["config"].cache_enabled is False
+    assert adapter.model_call_diagnostic()["prompt_ids"] == {
+        "rubric_generator_v1": 1,
+        "rubric_generator_json_repair_v1": 1,
+    }
+    assert adapter.model_call_diagnostic()["retry_count"] == 1
+
+
 def test_report_prompt_requires_quality_gate_headings():
     from backend.eval_agent.services.run_service import (
         _report_generator_system_message,
