@@ -58,7 +58,11 @@ def test_nginx_limits_tls_and_security_headers_are_configured():
 
     assert "listen 443 ssl" in config
     assert "listen 80" in config
-    assert "return 301 https://$host$request_uri" in config
+    assert "server_name agentpartner.top" in config
+    assert "server_name www.agentpartner.top" in config
+    assert "return 301 https://agentpartner.top$request_uri" in config
+    assert "/etc/letsencrypt/live/agentpartner.top/fullchain.pem" in config
+    assert "/etc/letsencrypt/live/agentpartner.top/privkey.pem" in config
     assert "client_max_body_size 10m" in config
     assert "limit_req_zone" in config
     assert "limit_req zone=agent_partner_api" in config
@@ -151,10 +155,11 @@ def test_install_release_rejects_local_secrets_and_activates_atomically():
 def test_readme_documents_temporary_public_beta_access():
     readme = _read("README.md")
 
-    assert "https://163.7.11.194" in readme
-    assert "self-signed" in readme.lower()
+    assert "https://agentpartner.top" in readme
+    assert "Let's Encrypt" in readme
+    assert "APP_AUTH_REQUIRED" in readme
     assert "APP_ACCESS_TOKEN" in readme
-    assert "shared" in readme.lower()
+    assert "intentionally anonymous" in readme
 
 
 def test_python_dependencies_are_exactly_locked():

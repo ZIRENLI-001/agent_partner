@@ -35,6 +35,7 @@ class Settings:
     eval_report_generator_model: str = "openai/gpt-4.1-mini"
     eval_instruction_parser_model: str = "openai/gpt-4.1-mini"
     access_token: str = ""
+    auth_required: bool = True
     allowed_model_api_bases: tuple[str, ...] = ("https://openrouter.ai/api/v1",)
     max_upload_bytes: int = 10 * 1024 * 1024
     max_json_body_bytes: int = 2 * 1024 * 1024
@@ -92,6 +93,15 @@ def _csv_values(value: str) -> tuple[str, ...]:
     return tuple(item.strip().rstrip("/") for item in value.split(",") if item.strip())
 
 
+def _bool_value(name: str, value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"true", "1", "yes", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean value")
+
+
 def settings_from_env() -> Settings:
     dotenv = _dotenv_values(project_root() / ".env")
     return Settings(
@@ -142,6 +152,10 @@ def settings_from_env() -> Settings:
             "EVAL_INSTRUCTION_PARSER_MODEL", "openai/gpt-4.1-mini", dotenv
         ),
         access_token=_env("APP_ACCESS_TOKEN", "", dotenv),
+        auth_required=_bool_value(
+            "APP_AUTH_REQUIRED",
+            _env("APP_AUTH_REQUIRED", "true", dotenv),
+        ),
         allowed_model_api_bases=_csv_values(
             _env(
                 "ALLOWED_MODEL_API_BASES",

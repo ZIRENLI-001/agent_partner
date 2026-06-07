@@ -40,7 +40,11 @@ class ApiTokenMiddleware(BaseHTTPMiddleware):
         ):
             return await call_next(request)
 
-        expected = settings_from_env().access_token
+        settings = settings_from_env()
+        if not settings.auth_required:
+            return await call_next(request)
+
+        expected = settings.access_token
         if not expected:
             return await call_next(request)
 

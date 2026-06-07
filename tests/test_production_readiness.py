@@ -5,6 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from backend.eval_agent.api.main import create_app
+from backend.eval_agent.core.config import settings_from_env
 from backend.eval_agent.providers.base import ModelConfig, ModelProviderError
 from backend.eval_agent.providers.openai_compatible import OpenAICompatibleProvider
 from backend.eval_agent.storage.artifact_store import ArtifactStore
@@ -173,6 +174,39 @@ def test_api_access_token_protects_business_routes(monkeypatch):
     assert unauthorized.status_code == 401
     assert authorized.status_code == 200
     assert health.status_code == 200
+
+
+def test_platform_authentication_defaults_to_required(monkeypatch):
+    monkeypatch.delenv("APP_AUTH_REQUIRED", raising=False)
+
+    assert settings_from_env().auth_required is True
+
+
+def test_production_allows_anonymous_access_when_auth_is_disabled(
+    monkeypatch,
+    tmp_path,
+):
+    frontend_dist = tmp_path / "frontend"
+    frontend_dist.mkdir()
+    (frontend_dist / "index.html").write_text("<html></html>", encoding="utf-8")
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("APP_AUTH_REQUIRED", "false")
+    monkeypatch.delenv("APP_ACCESS_TOKEN", raising=False)
+    monkeypatch.setenv("EVAL_FRONTEND_DIST", str(frontend_dist))
+
+    response = TestClient(create_app()).get(
+        "/api/context",
+        headers={"Host": "127.0.0.1"},
+    )
+
+    assert response.status_code == 200
+
+
+def test_invalid_platform_authentication_value_is_rejected(monkeypatch):
+    monkeypatch.setenv("APP_AUTH_REQUIRED", "sometimes")
+
+    with pytest.raises(ValueError, match="APP_AUTH_REQUIRED"):
+        settings_from_env()
 
 
 def test_production_requires_access_token(monkeypatch):

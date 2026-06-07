@@ -64,7 +64,8 @@ Copy `.env.example` if your shell workflow sources environment files, or export 
 Important variables:
 
 - `APP_ENV`: set to `production` for public deployment
-- `APP_ACCESS_TOKEN`: required in production; shared Bearer token used to protect business APIs
+- `APP_AUTH_REQUIRED`: defaults to `true`; set to `false` only when the deployment is intentionally public
+- `APP_ACCESS_TOKEN`: required in production when `APP_AUTH_REQUIRED=true`; shared Bearer token used to protect business APIs
 - `ALLOWED_MODEL_API_BASES`: comma-separated exact allowlist for model API base URLs
 - `MAX_UPLOAD_BYTES`: maximum uploaded file size, default 10 MiB
 - `HOST`: server host for `make dev`
@@ -103,6 +104,7 @@ For an internet-facing test deployment, configure at least:
 
 ```bash
 APP_ENV=production
+APP_AUTH_REQUIRED=true
 APP_ACCESS_TOKEN=<a-long-random-secret>
 ALLOWED_MODEL_API_BASES=https://openrouter.ai/api/v1
 MAX_UPLOAD_BYTES=10485760
@@ -117,6 +119,11 @@ stores it only in the current browser session.
 This shared token is suitable for a controlled beta, not full multi-user isolation.
 Do not allow untrusted users until per-user authentication, authorization, durable
 workers, and database-backed ownership checks are implemented.
+
+For a deliberately anonymous temporary deployment, set
+`APP_AUTH_REQUIRED=false`. This makes every business API and shared report
+accessible to anyone who discovers or receives the URL. HTTPS, rate limits,
+queue limits, upload limits, and model egress restrictions remain enabled.
 
 ## Deployment Notes
 
@@ -134,13 +141,13 @@ Regenerate dependencies and builds with `make install` and `make build`.
 ## Temporary Public Beta Deployment
 
 The temporary invited-test deployment is served at
-`https://163.7.11.194`. It uses a short-lived self-signed certificate, so
-browsers will show a certificate warning until the certificate is explicitly
-trusted.
+`https://agentpartner.top` using a publicly trusted Let's Encrypt certificate.
+`https://www.agentpartner.top` redirects to the canonical root domain.
 
-All business API requests require the shared `APP_ACCESS_TOKEN`. Treat this
-shared token as a password, distribute it only to invited testers, and rotate
-it by editing `/etc/agent-partner/agent-partner.env` followed by an API restart.
+Business API requests require the shared `APP_ACCESS_TOKEN` when
+`APP_AUTH_REQUIRED=true`. When `APP_AUTH_REQUIRED=false`, the site is
+intentionally anonymous and the token prompt is not shown. Restore the access
+gate by setting the switch back to `true` and restarting the API.
 The shared test environment also shares run history and artifacts between
 testers; do not submit sensitive production data.
 

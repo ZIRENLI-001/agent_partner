@@ -26,7 +26,7 @@ def create_app() -> FastAPI:
         Path(FRONTEND_DIST) if FRONTEND_DIST is not None else Path(settings.frontend_dist)
     )
     if production:
-        if not settings.access_token:
+        if settings.auth_required and not settings.access_token:
             raise RuntimeError("APP_ACCESS_TOKEN is required when APP_ENV=production")
         if not (frontend_dist / "index.html").is_file():
             raise RuntimeError("frontend production build is required")
