@@ -381,6 +381,38 @@ def test_model_transport_rejects_redirects():
     )
 
 
+def test_model_transport_passes_timeout_as_keyword(monkeypatch):
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self, size):
+            return b'{"choices":[{"message":{"content":"ok"}}]}'
+
+    calls = []
+
+    def opener(*args, **kwargs):
+        calls.append((args, kwargs))
+        return Response()
+
+    transport = UrllibJsonTransport(opener=opener)
+    monkeypatch.setenv("MODEL_RESPONSE_MAX_BYTES", "1024")
+
+    response = transport.post_json(
+        "https://models.example.test/v1/chat/completions",
+        {},
+        {"model": "test-model", "messages": []},
+        37,
+    )
+
+    assert response["choices"][0]["message"]["content"] == "ok"
+    assert len(calls[0][0]) == 1
+    assert calls[0][1] == {"timeout": 37}
+
+
 def test_model_response_body_is_bounded(monkeypatch):
     class OversizedResponse:
         def __init__(self):
@@ -398,7 +430,7 @@ def test_model_response_body_is_bounded(monkeypatch):
 
     response = OversizedResponse()
     transport = UrllibJsonTransport(
-        opener=lambda request, timeout: response,
+        opener=lambda request, *, timeout: response,
         max_response_bytes=32,
     )
     provider = OpenAICompatibleProvider(transport=transport)

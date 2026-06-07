@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from redis import Redis
 
 from backend.eval_agent.services.job_queue import (
     JobQueueFull,
@@ -10,6 +11,7 @@ from backend.eval_agent.services.job_queue import (
     JobQuotaExceeded,
     RedisJobQueue,
 )
+from backend.eval_agent.services.run_status_store import redis_client_from_url
 from backend.eval_agent.worker import process_next_job
 
 
@@ -100,6 +102,31 @@ def build_queue(
         status_ttl_seconds=86_400,
     )
     return queue, redis
+
+
+def test_redis_socket_timeout_exceeds_worker_blocking_claim(monkeypatch):
+    calls = []
+    client = object()
+
+    def fake_from_url(url, **kwargs):
+        calls.append((url, kwargs))
+        return client
+
+    monkeypatch.setattr(Redis, "from_url", fake_from_url)
+
+    result = redis_client_from_url("redis://127.0.0.1:6379/0")
+
+    assert result is client
+    assert calls == [
+        (
+            "redis://127.0.0.1:6379/0",
+            {
+                "decode_responses": True,
+                "socket_connect_timeout": 5,
+                "socket_timeout": 10,
+            },
+        )
+    ]
 
 
 def test_submit_enforces_jobs_per_ip_per_hour():

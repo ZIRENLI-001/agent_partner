@@ -52,7 +52,7 @@ class UrllibJsonTransport:
             if self.max_response_bytes is not None
             else settings_from_env().model_response_max_bytes
         )
-        with self.opener(req, timeout_seconds) as response:
+        with self.opener(req, timeout=timeout_seconds) as response:
             response_body = response.read(limit + 1)
         if len(response_body) > limit:
             raise ValueError("Model provider response is too large")
