@@ -1114,7 +1114,11 @@ def _system_message(task_spec: TaskSpec) -> dict[str, str]:
             "FAQ：\n%s\n"
             "按required_steps顺序推进；遇到用户不确定、拒绝、忙碌、地址异常或信息缺失时，先确认再推进。\n"
             "不得编造未提供的政策、补贴、承诺或订单信息；无法确认时应说明边界并请求核实。\n"
-            "回复应简洁，保持外呼口吻；只有任务已满足或安全终止时才可追加 <DONE>。"
+            "回复应简洁，保持外呼口吻。\n"
+            "只有最近一条 user_simulator 回复包含 <END_CONVERSATION>，表示用户明确结束时，"
+            "才可在自然收尾回复后追加 <DONE>。\n"
+            "用户仍有疑问、仍在补充信息或尚未明确结束时，不得提前输出 <DONE>，"
+            "应继续推进 required_steps；不得向用户解释控制标记。"
         )
         % (
             getattr(task_spec, "role", ""),
@@ -1148,7 +1152,10 @@ def _user_simulator_system_message(scenario: Scenario) -> dict[str, str]:
             "初始意图：%s\n"
             "测试重点：%s\n"
             "根据用户画像、difficulty和覆盖目标逐步施压或配合，保持同一人设和态度。\n"
-            "不要替助手完成任务，不要主动提供助手未问到的关键信息，不要解释你的策略。"
+            "按场景逐步回应，不要为了缩短评测而提前结束。\n"
+            "只有达到真实结束状态时，才在自然用户话语末尾追加 <END_CONVERSATION>。\n"
+            "除错号、立即挂断、明确拒绝继续等天然终局外，第一句用户回复不得追加结束标记。\n"
+            "不要替助手完成任务，不要主动提供助手未问到的关键信息，不要解释你的策略或控制标记。"
         )
         % (
             scenario.scenario_id,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
+from backend.evaluation_engine.dialogue_protocol import USER_END_MARKER
 from backend.evaluation_engine.domain import Scenario, TaskSpec, Turn
 
 USER_ORIGINATED_SPEAKERS = {"user", "user_simulator"}
@@ -44,19 +45,19 @@ class FakeUserProvider:
         targets = set(scenario.coverage_targets)
 
         if "faq_exit" in targets:
-            return "我想问下怎么退出飞毛腿？"
+            return "我想问下怎么退出飞毛腿？" + USER_END_MARKER
         if "reward_question" in targets:
-            return "那今天会有额外奖励吗？"
+            return "那今天会有额外奖励吗？" + USER_END_MARKER
         if "refusal_to_deliver" in targets:
-            return "我今天不太想配送。"
+            return "我今天不太想配送。" + USER_END_MARKER
         if "out_of_scope" in targets:
-            return "这个属于你职责范围吗？"
+            return "这个属于你职责范围吗？" + USER_END_MARKER
         if "busy_or_unavailable" in targets:
-            return "我现在有点忙，你简单说。"
+            return "我现在有点忙，你简单说。" + USER_END_MARKER
 
         if len(history) <= 1:
             return "是我，你说。"
-        return "好的，我知道了。"
+        return "好的，我知道了。" + USER_END_MARKER
 
 
 def _last_user_content(history: list[Turn]) -> str:

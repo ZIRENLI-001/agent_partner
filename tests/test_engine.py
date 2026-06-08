@@ -88,6 +88,96 @@ def _confirmed_stage_artifacts() -> tuple[TaskSpec, RubricSpec, ScenarioSet]:
     return task_spec, rubric, scenarios
 
 
+class TerminationProtocolAssistant:
+    def __init__(self):
+        self.replies = iter(
+            [
+                "Hello.",
+                "Let me provide the remaining details.<DONE>",
+                "Understood, goodbye.<DONE>",
+            ]
+        )
+
+    def generate(self, task_spec, history):
+        return next(self.replies)
+
+
+class TerminationProtocolUser:
+    def __init__(self):
+        self.replies = iter(
+            [
+                "I still need more details.",
+                "That answers my question.<END_CONVERSATION>",
+            ]
+        )
+
+    def generate(self, scenario, history):
+        return next(self.replies)
+
+
+class SingleScenarioProvider:
+    def generate(self, task_spec, rubric, input_data, minimum):
+        return ScenarioSet(
+            suite_id="suite_protocol",
+            task_id=task_spec.task_id,
+            scenarios=[
+                Scenario(
+                    scenario_id="scenario_protocol",
+                    task_id=task_spec.task_id,
+                    user_profile={"attitude": "neutral"},
+                    coverage_targets=["task_completion"],
+                    initial_user_intent="Ask for details",
+                    expected_test_focus="Explicit dialogue termination",
+                )
+            ],
+        )
+
+
+@pytest.mark.parametrize("use_confirmed_artifacts", [False, True])
+def test_run_full_evaluation_uses_shared_termination_protocol(
+    tmp_path: Path,
+    use_confirmed_artifacts: bool,
+):
+    kwargs = {}
+    if use_confirmed_artifacts:
+        task_spec, rubric, scenarios = _confirmed_stage_artifacts()
+        scenarios.scenarios[0].scenario_id = "scenario_protocol"
+        kwargs = {
+            "confirmed_task_spec": task_spec,
+            "confirmed_rubric_spec": rubric,
+            "confirmed_scenario_set": scenarios,
+        }
+
+    run = run_full_evaluation(
+        raw_instruction=RAW_TASK,
+        run_root=tmp_path,
+        assistant_provider=TerminationProtocolAssistant(),
+        user_provider=TerminationProtocolUser(),
+        minimum_scenarios=1,
+        scenario_provider=None if use_confirmed_artifacts else SingleScenarioProvider(),
+        quality_auto_repair=False,
+        **kwargs,
+    )
+
+    trace = run.traces[0]
+    assert len(trace.turns) == 5
+    assert trace.termination_reason == "task_completed"
+    assert all(
+        "<DONE>" not in turn.content
+        and "<END_CONVERSATION>" not in turn.content
+        for turn in trace.turns
+    )
+    if use_confirmed_artifacts:
+        for stage in (
+            "instruction_parsing",
+            "rubric_generation",
+            "scenario_generation",
+        ):
+            assert run.stage_diagnostics[stage]["output_source"] == (
+                "confirmed_stage_artifact"
+            )
+
+
 def test_run_full_evaluation_reuses_confirmed_stage_artifacts(tmp_path: Path):
     class UnexpectedParser:
         def parse(self, *args, **kwargs):
