@@ -40,6 +40,13 @@ A normal completed dialogue requires this sequence:
    `<DONE>`.
 3. The runner records `termination_reason="task_completed"`.
 
+The user marker is definitive: after it appears, the runner allows exactly one
+assistant closing response and never asks the simulated user to speak again.
+If the assistant omits `<DONE>`, or the user ends before the normal minimum
+length, the runner records `termination_reason="user_ended"`. This preserves
+the target model's incomplete closing behavior for judging without inventing
+dialogue after the user has hung up or refused to continue.
+
 The user simulator may emit its marker when the user has:
 
 - clearly acknowledged the completed task;
@@ -64,10 +71,11 @@ The default budget becomes eight complete user interaction rounds:
 `RunConfig.max_turns` remains the persisted compatibility field and defaults
 to `17`. Existing callers that provide a custom value continue to work.
 
-A normal completion is not accepted before five persisted messages. This
-prevents a first user reply and first target reply from prematurely ending the
-evaluation. The maximum-turn budget remains a hard safety fallback and records
-`termination_reason="max_turns"`.
+A normal `task_completed` completion is not accepted before five persisted
+messages. This prevents a first user reply and first target reply from
+prematurely claiming task completion. Inherently terminal scenarios may still
+end earlier as `user_ended`. The maximum-turn budget remains a hard safety
+fallback and records `termination_reason="max_turns"`.
 
 If the user signals an ending on the last available user slot, the runner
 reserves the final slot for the target model's closing response. It does not
@@ -136,9 +144,11 @@ the same engine runner.
 Tests will verify:
 
 - early assistant `<DONE>` does not terminate;
-- user `<END_CONVERSATION>` alone does not terminate before an assistant
-  closing response;
+- user `<END_CONVERSATION>` always receives one assistant closing response and
+  never receives another simulated user turn;
 - paired user and assistant markers terminate after the minimum length;
+- early terminal users and missing assistant confirmation terminate as
+  `user_ended`;
 - markers do not appear in persisted traces;
 - the default budget allows eight complete user interaction rounds and cannot
   stop on a user message;
