@@ -70,6 +70,9 @@ def test_nginx_limits_tls_and_security_headers_are_configured():
     assert "limit_req zone=agent_partner_status" in config
     assert "limit_req_status 429" in config
     assert 'location ~ "^/api/runs/run_[0-9a-f]{8}/status$"' in config
+    assert "location /api/stages/" in config
+    assert config.count("proxy_read_timeout 420s;") >= 2
+    assert config.count("proxy_send_timeout 420s;") >= 2
     assert "proxy_pass http://127.0.0.1:8070" in config
     assert "proxy_set_header X-Forwarded-For $remote_addr" in config
     assert "Content-Security-Policy" in config
