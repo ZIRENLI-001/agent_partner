@@ -20,6 +20,7 @@ from backend.eval_agent.services.run_service import (
     run_status_payload,
     submit_run_payload,
 )
+from backend.evaluation_engine.domain import RubricSpec, ScenarioSet, TaskSpec
 
 router = APIRouter(prefix="/api/runs", tags=["runs"])
 
@@ -45,6 +46,9 @@ class RunRequest(BaseModel):
         alias="model_config",
     )
     selected_scenario_ids: list[str] = Field(default_factory=list, max_length=20)
+    task_spec: Optional[TaskSpec] = None
+    rubric_spec: Optional[RubricSpec] = None
+    scenario_set: Optional[ScenarioSet] = None
     workspace_id: str = Field(default="workspace_demo", max_length=128)
     project_id: str = Field(default="project_meituan_fulfillment", max_length=128)
     created_by: str = Field(default="demo_user", max_length=128)

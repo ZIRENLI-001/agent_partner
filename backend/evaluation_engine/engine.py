@@ -130,6 +130,9 @@ def run_full_evaluation(
     run_id: str | None = None,
     progress_callback: Callable[[str, str], None] | None = None,
     quality_auto_repair: bool = True,
+    confirmed_task_spec: TaskSpec | None = None,
+    confirmed_rubric_spec: RubricSpec | None = None,
+    confirmed_scenario_set: ScenarioSet | None = None,
 ) -> FullRunResult:
     run_id = run_id or "run_%s" % uuid4().hex[:8]
     store = RunStore(run_root)
@@ -140,7 +143,12 @@ def run_full_evaluation(
         "instruction_parsing",
         stage_timings_ms,
         progress_callback,
-        lambda: parse_task_spec(
+        lambda: _confirmed_task_spec(
+            confirmed_task_spec,
+            stage_diagnostics,
+        )
+        if confirmed_task_spec is not None
+        else parse_task_spec(
             raw_instruction,
             task_id="task_001",
             input_data=input_data,
@@ -152,7 +160,13 @@ def run_full_evaluation(
         "rubric_generation",
         stage_timings_ms,
         progress_callback,
-        lambda: build_rubric_spec(
+        lambda: _confirmed_rubric_spec(
+            confirmed_rubric_spec,
+            task_spec,
+            stage_diagnostics,
+        )
+        if confirmed_rubric_spec is not None
+        else build_rubric_spec(
             task_spec,
             raw_instruction=raw_instruction,
             rubric_provider=rubric_provider,
@@ -163,7 +177,13 @@ def run_full_evaluation(
         "scenario_generation",
         stage_timings_ms,
         progress_callback,
-        lambda: generate_scenario_set(
+        lambda: _confirmed_scenario_set(
+            confirmed_scenario_set,
+            task_spec,
+            stage_diagnostics,
+        )
+        if confirmed_scenario_set is not None
+        else generate_scenario_set(
             task_spec,
             rubric,
             minimum=minimum_scenarios,
@@ -180,6 +200,10 @@ def run_full_evaluation(
             for scenario in scenario_set.scenarios
             if scenario.scenario_id in selected_ids
         ]
+        if not scenario_set.scenarios:
+            raise ValueError("No selected scenarios matched the scenario set")
+    elif not scenario_set.scenarios:
+        raise ValueError("No scenarios are available for evaluation")
     run_config = RunConfig(run_id=run_id, task_id=task_spec.task_id)
 
     traces, results = _timed_stage(
@@ -247,6 +271,7 @@ def run_full_evaluation(
             scenario_batch_size=scenario_batch_size,
             stage_timings_ms=stage_timings_ms,
             stage_diagnostics=stage_diagnostics,
+            confirmed_scenario_set=confirmed_scenario_set is not None,
         )
     else:
         quality_summary["auto_repair"] = {
@@ -307,6 +332,60 @@ def run_full_evaluation(
     )
 
 
+def _confirmed_task_spec(
+    task_spec: TaskSpec,
+    stage_diagnostics: dict[str, dict[str, object]],
+) -> TaskSpec:
+    _record_stage_diagnostic(
+        stage_diagnostics,
+        "instruction_parsing",
+        output_source="confirmed_stage_artifact",
+        model_attempted=False,
+        fallback_used=False,
+        input_context_used=True,
+    )
+    return task_spec.model_copy(deep=True)
+
+
+def _confirmed_rubric_spec(
+    rubric: RubricSpec,
+    task_spec: TaskSpec,
+    stage_diagnostics: dict[str, dict[str, object]],
+) -> RubricSpec:
+    if rubric.task_id != task_spec.task_id:
+        raise ValueError("Confirmed rubric task_id does not match task_spec")
+    _record_stage_diagnostic(
+        stage_diagnostics,
+        "rubric_generation",
+        output_source="confirmed_stage_artifact",
+        model_attempted=False,
+        fallback_used=False,
+        quality_report=rubric_quality_report(task_spec, rubric),
+    )
+    return rubric.model_copy(deep=True)
+
+
+def _confirmed_scenario_set(
+    scenario_set: ScenarioSet,
+    task_spec: TaskSpec,
+    stage_diagnostics: dict[str, dict[str, object]],
+) -> ScenarioSet:
+    if scenario_set.task_id != task_spec.task_id:
+        raise ValueError("Confirmed scenario_set task_id does not match task_spec")
+    for scenario in scenario_set.scenarios:
+        if scenario.task_id != task_spec.task_id:
+            raise ValueError("Confirmed scenario task_id does not match task_spec")
+    _record_stage_diagnostic(
+        stage_diagnostics,
+        "scenario_generation",
+        output_source="confirmed_stage_artifact",
+        model_attempted=False,
+        fallback_used=False,
+        scenario_count=len(scenario_set.scenarios),
+    )
+    return scenario_set.model_copy(deep=True)
+
+
 def _auto_repair_quality_once(
     quality_summary: dict[str, object],
     run_id: str,
@@ -330,6 +409,7 @@ def _auto_repair_quality_once(
     scenario_batch_size: int | None,
     stage_timings_ms: dict[str, int],
     stage_diagnostics: dict[str, dict[str, object]],
+    confirmed_scenario_set: bool,
 ) -> tuple[
     ScenarioSet,
     list[DialogueTrace],
@@ -352,7 +432,7 @@ def _auto_repair_quality_once(
     selected_ids = set(selected_scenario_ids or [])
     should_regenerate_scenarios = any(
         action.get("stage") == "scenarios" for action in actions
-    ) and not selected_ids
+    ) and not selected_ids and not confirmed_scenario_set
     should_rerun = should_regenerate_scenarios or any(
         action.get("stage") == "run" for action in actions
     )

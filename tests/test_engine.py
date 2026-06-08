@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from backend.evaluation_engine.domain import (
     DialogueTrace,
     EvaluationResult,
@@ -10,6 +12,7 @@ from backend.evaluation_engine.domain import (
     Report,
     Scenario,
     ScenarioSet,
+    TaskSpec,
     Turn,
 )
 from backend.evaluation_engine.engine import (
@@ -42,6 +45,110 @@ RAW_TASK = """# Role
 - 每次回复控制在约 30 个字以内。
 - 如被问及超出职责范围的问题，回复确认后再回电。
 """
+
+
+def _confirmed_stage_artifacts() -> tuple[TaskSpec, RubricSpec, ScenarioSet]:
+    task_spec = TaskSpec(
+        task_id="task_confirmed",
+        task_name="Confirmed staged task",
+        role="Contract specialist",
+        target_user="Contract user",
+        task_goal="Confirm the contract status",
+        opening_line="Hello, I am calling about your contract.",
+        required_steps=["Confirm the contract is active"],
+    )
+    rubric = RubricSpec(
+        rubric_id="rubric_confirmed",
+        task_id=task_spec.task_id,
+        items=[
+            RubricItem(
+                item_id="confirmed_item",
+                dimension="task_completion",
+                criterion="Confirms the contract is active",
+                source="required_steps",
+                check_type="rule",
+                weight=10,
+            )
+        ],
+    )
+    scenarios = ScenarioSet(
+        suite_id="suite_confirmed",
+        task_id=task_spec.task_id,
+        scenarios=[
+            Scenario(
+                scenario_id="confirmed_scene",
+                task_id=task_spec.task_id,
+                user_profile={"attitude": "neutral"},
+                coverage_targets=["confirmed_item"],
+                initial_user_intent="Ask whether the contract is active",
+                expected_test_focus="Contract confirmation",
+            )
+        ],
+    )
+    return task_spec, rubric, scenarios
+
+
+def test_run_full_evaluation_reuses_confirmed_stage_artifacts(tmp_path: Path):
+    class UnexpectedParser:
+        def parse(self, *args, **kwargs):
+            raise AssertionError("parser should not be called")
+
+    class UnexpectedRubricGenerator:
+        def build(self, *args, **kwargs):
+            raise AssertionError("rubric generator should not be called")
+
+    class UnexpectedScenarioGenerator:
+        def generate(self, *args, **kwargs):
+            raise AssertionError("scenario generator should not be called")
+
+    task_spec, rubric, scenarios = _confirmed_stage_artifacts()
+
+    run = run_full_evaluation(
+        raw_instruction=RAW_TASK,
+        run_root=tmp_path,
+        assistant_provider=FakeAssistantProvider(),
+        user_provider=FakeUserProvider(),
+        selected_scenario_ids=["confirmed_scene"],
+        parser_provider=UnexpectedParser(),
+        rubric_provider=UnexpectedRubricGenerator(),
+        scenario_provider=UnexpectedScenarioGenerator(),
+        confirmed_task_spec=task_spec,
+        confirmed_rubric_spec=rubric,
+        confirmed_scenario_set=scenarios,
+        quality_auto_repair=False,
+    )
+
+    assert run.task_spec.task_id == "task_confirmed"
+    assert run.rubric_spec.rubric_id == "rubric_confirmed"
+    assert [item.scenario_id for item in run.scenario_set.scenarios] == [
+        "confirmed_scene"
+    ]
+    assert run.stage_diagnostics["instruction_parsing"]["output_source"] == (
+        "confirmed_stage_artifact"
+    )
+    assert run.stage_diagnostics["rubric_generation"]["output_source"] == (
+        "confirmed_stage_artifact"
+    )
+    assert run.stage_diagnostics["scenario_generation"]["output_source"] == (
+        "confirmed_stage_artifact"
+    )
+
+
+def test_run_full_evaluation_rejects_stale_selected_scenario_ids(tmp_path: Path):
+    task_spec, rubric, scenarios = _confirmed_stage_artifacts()
+
+    with pytest.raises(ValueError, match="selected scenarios"):
+        run_full_evaluation(
+            raw_instruction=RAW_TASK,
+            run_root=tmp_path,
+            assistant_provider=FakeAssistantProvider(),
+            user_provider=FakeUserProvider(),
+            selected_scenario_ids=["stale_preview_scene"],
+            confirmed_task_spec=task_spec,
+            confirmed_rubric_spec=rubric,
+            confirmed_scenario_set=scenarios,
+            quality_auto_repair=False,
+        )
 
 
 def test_model_call_diagnostics_are_attached_to_their_actual_stages():

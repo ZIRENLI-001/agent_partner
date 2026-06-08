@@ -17,6 +17,13 @@ from backend.eval_agent.providers.openai_compatible import (
 from backend.eval_agent.services.job_queue import JobQueueFull, JobQuotaExceeded
 from backend.eval_agent.services import health_service, run_service
 from backend.evaluation_engine import app as engine_app
+from backend.evaluation_engine.domain import (
+    RubricItem,
+    RubricSpec,
+    Scenario,
+    ScenarioSet,
+    TaskSpec,
+)
 
 
 def configure_production(monkeypatch, frontend_dist):
@@ -73,6 +80,60 @@ def test_public_beta_settings_are_loaded(monkeypatch):
 def test_run_request_rejects_oversized_fields(payload):
     with pytest.raises(ValidationError):
         RunRequest(**payload)
+
+
+def test_run_request_serializes_confirmed_stage_artifacts():
+    task_spec = TaskSpec(
+        task_id="task_confirmed",
+        task_name="Confirmed task",
+        role="Specialist",
+        target_user="User",
+        task_goal="Confirm status",
+        opening_line="Hello",
+    )
+    rubric_spec = RubricSpec(
+        rubric_id="rubric_confirmed",
+        task_id=task_spec.task_id,
+        items=[
+            RubricItem(
+                item_id="item_confirmed",
+                dimension="task_completion",
+                criterion="Confirm status",
+                source="task_goal",
+                check_type="rule",
+                weight=10,
+            )
+        ],
+    )
+    scenario_set = ScenarioSet(
+        suite_id="suite_confirmed",
+        task_id=task_spec.task_id,
+        scenarios=[
+            Scenario(
+                scenario_id="scene_confirmed",
+                task_id=task_spec.task_id,
+                user_profile={"attitude": "neutral"},
+                coverage_targets=["item_confirmed"],
+                initial_user_intent="Ask for status",
+                expected_test_focus="Status confirmation",
+            )
+        ],
+    )
+
+    request = RunRequest(
+        instruction="Confirm status",
+        model_config={"provider": "openrouter", "api_key": "sk-secret"},
+        task_spec=task_spec,
+        rubric_spec=rubric_spec,
+        scenario_set=scenario_set,
+    )
+    payload = request.model_dump(mode="json", by_alias=True)
+
+    assert payload["task_spec"]["task_id"] == "task_confirmed"
+    assert payload["rubric_spec"]["rubric_id"] == "rubric_confirmed"
+    assert payload["scenario_set"]["scenarios"][0]["scenario_id"] == (
+        "scene_confirmed"
+    )
 
 
 def test_run_detail_rejects_windows_and_posix_path_traversal(tmp_path, monkeypatch):

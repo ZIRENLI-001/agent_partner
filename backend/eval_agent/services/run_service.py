@@ -610,6 +610,9 @@ def create_run_payload(request: Any) -> dict[str, object]:
             minimum_scenarios=request.minimum_scenarios,
             input_data=request.input_data,
             selected_scenario_ids=request.selected_scenario_ids,
+            confirmed_task_spec=getattr(request, "task_spec", None),
+            confirmed_rubric_spec=getattr(request, "rubric_spec", None),
+            confirmed_scenario_set=getattr(request, "scenario_set", None),
             model_config_summary=summary,
             stage_model_config_summary=stage_summary,
             run_context=context,
@@ -734,6 +737,9 @@ def _execute_run_job(request: Any, run_id: str) -> None:
         minimum_scenarios=request.minimum_scenarios,
         input_data=request.input_data,
         selected_scenario_ids=request.selected_scenario_ids,
+        confirmed_task_spec=getattr(request, "task_spec", None),
+        confirmed_rubric_spec=getattr(request, "rubric_spec", None),
+        confirmed_scenario_set=getattr(request, "scenario_set", None),
         model_config_summary=summary,
         stage_model_config_summary=stage_summary,
         run_context=context,
@@ -859,6 +865,9 @@ def _request_payload(request: Any) -> dict[str, object]:
             "max_tokens": getattr(model_config, "max_tokens", None),
         },
         "selected_scenario_ids": getattr(request, "selected_scenario_ids", []),
+        "task_spec": _json_model_payload(getattr(request, "task_spec", None)),
+        "rubric_spec": _json_model_payload(getattr(request, "rubric_spec", None)),
+        "scenario_set": _json_model_payload(getattr(request, "scenario_set", None)),
         "workspace_id": getattr(request, "workspace_id", "workspace_demo"),
         "project_id": getattr(
             request,
@@ -867,6 +876,14 @@ def _request_payload(request: Any) -> dict[str, object]:
         ),
         "created_by": getattr(request, "created_by", "demo_user"),
     }
+
+
+def _json_model_payload(value: Any) -> object:
+    if value is None:
+        return None
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    return value
 
 
 def _new_run_id() -> str:

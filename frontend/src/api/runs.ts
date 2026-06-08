@@ -1,4 +1,5 @@
 import { request } from "./client";
+import { type ScenarioSetPayload } from "./stages";
 
 export interface ModelConfig {
   provider?: string;
@@ -16,6 +17,9 @@ export interface RunRequest {
   minimum_scenarios?: number;
   model_config?: ModelConfig;
   selected_scenario_ids?: string[];
+  task_spec?: Record<string, unknown>;
+  rubric_spec?: Record<string, unknown>;
+  scenario_set?: ScenarioSetPayload;
 }
 
 export interface RunSummary {
