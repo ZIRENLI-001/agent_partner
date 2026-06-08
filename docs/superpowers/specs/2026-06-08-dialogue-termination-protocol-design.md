@@ -54,15 +54,15 @@ explicit terminal user signal. An early `<DONE>` is stripped and ignored.
 
 ## Turn Budget
 
-The default budget becomes six complete user interaction rounds:
+The default budget becomes eight complete user interaction rounds:
 
 - one opening assistant message;
-- up to six user messages;
-- up to six assistant responses;
-- at most thirteen persisted messages.
+- up to eight user messages;
+- up to eight assistant responses;
+- at most seventeen persisted messages.
 
 `RunConfig.max_turns` remains the persisted compatibility field and defaults
-to `13`. Existing callers that provide a custom value continue to work.
+to `17`. Existing callers that provide a custom value continue to work.
 
 A normal completion is not accepted before five persisted messages. This
 prevents a first user reply and first target reply from prematurely ending the
@@ -140,7 +140,7 @@ Tests will verify:
   closing response;
 - paired user and assistant markers terminate after the minimum length;
 - markers do not appear in persisted traces;
-- the default budget allows six complete user interaction rounds and cannot
+- the default budget allows eight complete user interaction rounds and cannot
   stop on a user message;
 - missing markers still terminate at the hard cap;
 - wrong-role markers do not terminate;
