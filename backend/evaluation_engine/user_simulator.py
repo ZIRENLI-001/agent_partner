@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+from backend.evaluation_engine.dialogue_protocol import (
+    USER_END_MARKER,
+    parse_controlled_text,
+)
 from backend.evaluation_engine.domain import Scenario, Turn
 from backend.evaluation_engine.providers import UserProvider
 
 
 def next_user_turn(provider: UserProvider, scenario: Scenario, history: list[Turn]) -> str:
-    content = provider.generate(scenario, history).strip()
-    if content and is_valid_user_turn(content, scenario, history):
-        return content
-    fallback = _fallback_user_turn(scenario, history)
-    if is_valid_user_turn(fallback, scenario, history):
-        return fallback
-    return "我没太听清。"
+    content, user_ended = parse_controlled_text(
+        provider.generate(scenario, history).strip(),
+        expected_marker=USER_END_MARKER,
+    )
+    if not content or not is_valid_user_turn(content, scenario, history):
+        content = _fallback_user_turn(scenario, history)
+    if not is_valid_user_turn(content, scenario, history):
+        content = "我没太听清。"
+    return content + (USER_END_MARKER if user_ended else "")
 
 
 def is_valid_user_turn(

@@ -159,6 +159,10 @@ def test_dialogue_simulation_prompts_focus_on_user_reactions_and_coverage_mappin
     assert "前后身份和立场必须一致" in combined
     assert "不得跨业务线串场" in combined
     assert "initial_user_intent只能是用户本人自然开口" in combined
+    assert "<END_CONVERSATION>" in simulator
+    assert "真实结束状态" in simulator
+    assert "逐步回应" in simulator
+    assert "第一句用户回复" in simulator
 
 
 def test_execution_prompt_sets_task_boundaries_without_revealing_evaluation_strategy() -> None:
@@ -169,6 +173,9 @@ def test_execution_prompt_sets_task_boundaries_without_revealing_evaluation_stra
     assert "先确认再推进" in content
     assert "不得编造" in content
     assert "<DONE>" in content
+    assert "<END_CONVERSATION>" in content
+    assert "用户明确结束" in content
+    assert "不得提前输出 <DONE>" in content
 
 
 def test_judge_prompts_require_actual_evidence_and_no_unstated_inference() -> None:

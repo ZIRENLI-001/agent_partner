@@ -2,15 +2,20 @@ from __future__ import annotations
 
 import json
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Optional
+from threading import Lock
+from typing import Any, Callable, Optional
 from uuid import uuid4
 
 from backend.eval_agent.core.config import settings_from_env
 from backend.eval_agent.providers.base import ModelConfig as ProviderModelConfig
 from backend.eval_agent.providers.base import ModelProvider
 from backend.eval_agent.providers.openai_compatible import OpenAICompatibleProvider
+from backend.eval_agent.services.job_queue import (
+    JobQueueUnavailable,
+    RedisJobQueue,
+)
 from backend.evaluation_engine import app as engine_app
 from backend.evaluation_engine.domain import (
     DialogueTrace,
@@ -37,6 +42,7 @@ MOCK_PROVIDER_TYPES = {"", "mock"}
 REAL_PROVIDER_TYPES = {"openrouter", "openai_compatible", "internal_gateway"}
 RUN_ROOT: Path | None = None
 RUN_STATUS_STORE: Any | None = None
+JOB_QUEUE: RedisJobQueue | None = None
 ASYNC_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 STAGE_MODEL_ROLES = [
     "target_model",
@@ -60,6 +66,91 @@ class RuntimeModelConfig:
     max_tokens: Optional[int] = None
 
 
+class _ModelCallTracker:
+    def __init__(self, config: ProviderModelConfig):
+        self.config = config
+        self._lock = Lock()
+        self._prompt_ids: dict[str, int] = {}
+        self._model_call_count = 0
+        self._retry_count = 0
+        self._next_call_is_retry = False
+
+    def record(self, prompt_id: str, *, retry: bool = False) -> None:
+        with self._lock:
+            retry = retry or self._next_call_is_retry
+            self._next_call_is_retry = False
+            self._prompt_ids[prompt_id] = self._prompt_ids.get(prompt_id, 0) + 1
+            self._model_call_count += 1
+            if retry:
+                self._retry_count += 1
+
+    def mark_next_call_as_retry(self) -> None:
+        with self._lock:
+            self._next_call_is_retry = True
+
+    def summary(self) -> dict[str, object]:
+        with self._lock:
+            return {
+                "provider": self.config.provider_type,
+                "model_name": self.config.model_name,
+                "prompt_ids": dict(self._prompt_ids),
+                "model_call_count": self._model_call_count,
+                "retry_count": self._retry_count,
+            }
+
+
+class _TrackedModelAdapter:
+    def _init_model_call_tracker(self, config: ProviderModelConfig) -> None:
+        self._model_calls = _ModelCallTracker(config)
+
+    def _record_model_call(self, prompt_id: str, *, retry: bool = False) -> None:
+        self._model_calls.record(prompt_id, retry=retry)
+
+    def mark_next_model_call_as_retry(self) -> None:
+        self._model_calls.mark_next_call_as_retry()
+
+    def model_call_diagnostic(self) -> dict[str, object]:
+        return self._model_calls.summary()
+
+    def _generate_structured_response(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        prompt_id: str,
+        repair_prompt_id: str,
+        repair_stage: str,
+        minimum_repair_tokens: int,
+        parse_response: Callable[[str], Any],
+    ) -> Any:
+        self._record_model_call(prompt_id)
+        response = self.model_provider.generate(messages, self.config)
+        try:
+            return parse_response(response.content)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            repair_config = replace(
+                self.config,
+                temperature=0,
+                max_tokens=max(
+                    minimum_repair_tokens,
+                    int(self.config.max_tokens or 0),
+                ),
+                cache_enabled=False,
+            )
+            repair_messages = messages + [
+                {"role": "assistant", "content": response.content},
+                {
+                    "role": "user",
+                    "content": _structured_json_repair_message(
+                        repair_stage,
+                        exc,
+                    ),
+                },
+            ]
+            self._record_model_call(repair_prompt_id, retry=True)
+            repaired = self.model_provider.generate(repair_messages, repair_config)
+            return parse_response(repaired.content)
+
+
 def model_config_summary(model_config: Any) -> dict[str, Any]:
     return engine_app._model_config_summary(model_config)
 
@@ -68,7 +159,7 @@ def run_context(request: Any) -> dict[str, object]:
     return engine_app._run_context(request)
 
 
-class AssistantModelAdapter:
+class AssistantModelAdapter(_TrackedModelAdapter):
     def __init__(
         self,
         config: ProviderModelConfig,
@@ -76,8 +167,10 @@ class AssistantModelAdapter:
     ):
         self.config = config
         self.model_provider = model_provider or OpenAICompatibleProvider()
+        self._init_model_call_tracker(config)
 
     def generate(self, task_spec: TaskSpec, history: list[Turn]) -> str:
+        self._record_model_call("target_dialogue_v1")
         response = self.model_provider.generate(
             [_system_message(task_spec)] + [_turn_message(turn) for turn in history],
             self.config,
@@ -85,7 +178,7 @@ class AssistantModelAdapter:
         return response.content
 
 
-class UserModelAdapter:
+class UserModelAdapter(_TrackedModelAdapter):
     def __init__(
         self,
         config: ProviderModelConfig,
@@ -93,8 +186,10 @@ class UserModelAdapter:
     ):
         self.config = config
         self.model_provider = model_provider or OpenAICompatibleProvider()
+        self._init_model_call_tracker(config)
 
     def generate(self, scenario: Scenario, history: list[Turn]) -> str:
+        self._record_model_call("user_simulator_v1")
         response = self.model_provider.generate(
             [_user_simulator_system_message(scenario)]
             + [_user_simulator_history_message(history)],
@@ -103,7 +198,7 @@ class UserModelAdapter:
         return _clean_model_text(response.content)
 
 
-class SemanticJudgeModelAdapter:
+class SemanticJudgeModelAdapter(_TrackedModelAdapter):
     def __init__(
         self,
         config: ProviderModelConfig,
@@ -111,8 +206,10 @@ class SemanticJudgeModelAdapter:
     ):
         self.config = config
         self.model_provider = model_provider or OpenAICompatibleProvider()
+        self._init_model_call_tracker(config)
 
     def judge(self, trace: DialogueTrace, item: RubricItem) -> EvidenceItem:
+        self._record_model_call("semantic_judge_single_v1")
         response = self.model_provider.generate(
             [
                 _semantic_judge_system_message(),
@@ -129,6 +226,7 @@ class SemanticJudgeModelAdapter:
     def judge_many(self, trace: DialogueTrace, items: list[RubricItem]) -> list[EvidenceItem]:
         if not items:
             return []
+        self._record_model_call("semantic_judge_batch_v1")
         response = self.model_provider.generate(
             [
                 _semantic_judge_system_message(batch=True),
@@ -178,7 +276,7 @@ class SemanticJudgeModelAdapter:
         ]
 
 
-class ModelScenarioGeneratorAdapter:
+class ModelScenarioGeneratorAdapter(_TrackedModelAdapter):
     def __init__(
         self,
         config: ProviderModelConfig,
@@ -186,6 +284,7 @@ class ModelScenarioGeneratorAdapter:
     ):
         self.config = config
         self.model_provider = model_provider or OpenAICompatibleProvider()
+        self._init_model_call_tracker(config)
 
     def generate(
         self,
@@ -194,26 +293,32 @@ class ModelScenarioGeneratorAdapter:
         input_data: str,
         minimum: int,
     ) -> ScenarioSet:
-        response = self.model_provider.generate(
-            [
-                _scenario_generator_system_message(),
-                {
-                    "role": "user",
-                    "content": _scenario_generator_user_message(
-                        task_spec,
-                        rubric,
-                        input_data,
-                        minimum,
-                    ),
-                },
-            ],
-            self.config,
+        messages = [
+            _scenario_generator_system_message(),
+            {
+                "role": "user",
+                "content": _scenario_generator_user_message(
+                    task_spec,
+                    rubric,
+                    input_data,
+                    minimum,
+                ),
+            },
+        ]
+        def parse_response(content: str) -> ScenarioSet:
+            payload = _parse_json_object(content)
+            return _scenario_set_from_model_payload(payload, task_spec)
+
+        return self._generate_structured_response(
+            messages=messages,
+            prompt_id="scenario_generator_v1",
+            repair_prompt_id="scenario_generator_json_repair_v1",
+            repair_stage="scenario_generator",
+            minimum_repair_tokens=6000,
+            parse_response=parse_response,
         )
-        payload = _parse_json_object(response.content)
-        return _scenario_set_from_model_payload(payload, task_spec)
 
-
-class ModelInstructionParserAdapter:
+class ModelInstructionParserAdapter(_TrackedModelAdapter):
     def __init__(
         self,
         config: ProviderModelConfig,
@@ -221,6 +326,7 @@ class ModelInstructionParserAdapter:
     ):
         self.config = config
         self.model_provider = model_provider or OpenAICompatibleProvider()
+        self._init_model_call_tracker(config)
 
     def parse(
         self,
@@ -228,29 +334,37 @@ class ModelInstructionParserAdapter:
         task_id: str,
         input_data: str = "",
     ) -> TaskSpec:
-        response = self.model_provider.generate(
-            [
-                _instruction_parser_system_message(),
-                {
-                    "role": "user",
-                    "content": _instruction_parser_user_message(
-                        raw_instruction,
-                        task_id,
-                        input_data=input_data,
-                    ),
-                },
-            ],
-            self.config,
+        messages = [
+            _instruction_parser_system_message(),
+            {
+                "role": "user",
+                "content": _instruction_parser_user_message(
+                    raw_instruction,
+                    task_id,
+                    input_data=input_data,
+                ),
+            },
+        ]
+
+        def parse_response(content: str) -> TaskSpec:
+            payload = _parse_json_object(content)
+            payload = payload.get("task_spec", payload)
+            if not isinstance(payload, dict):
+                raise ValueError("instruction parser output is not an object")
+            payload["task_id"] = task_id
+            return TaskSpec(**payload)
+
+        return self._generate_structured_response(
+            messages=messages,
+            prompt_id="instruction_parser_v1",
+            repair_prompt_id="instruction_parser_json_repair_v1",
+            repair_stage="instruction_parser",
+            minimum_repair_tokens=3000,
+            parse_response=parse_response,
         )
-        payload = _parse_json_object(response.content)
-        payload = payload.get("task_spec", payload)
-        if not isinstance(payload, dict):
-            raise ValueError("instruction parser output is not an object")
-        payload["task_id"] = task_id
-        return TaskSpec(**payload)
 
 
-class ModelRubricGeneratorAdapter:
+class ModelRubricGeneratorAdapter(_TrackedModelAdapter):
     def __init__(
         self,
         config: ProviderModelConfig,
@@ -258,29 +372,38 @@ class ModelRubricGeneratorAdapter:
     ):
         self.config = config
         self.model_provider = model_provider or OpenAICompatibleProvider()
+        self._init_model_call_tracker(config)
 
     def build(self, task_spec: TaskSpec, raw_instruction: str) -> RubricSpec:
-        response = self.model_provider.generate(
-            [
-                _rubric_generator_system_message(),
-                {
-                    "role": "user",
-                    "content": _rubric_generator_user_message(task_spec, raw_instruction),
-                },
-            ],
-            self.config,
+        messages = [
+            _rubric_generator_system_message(),
+            {
+                "role": "user",
+                "content": _rubric_generator_user_message(task_spec, raw_instruction),
+            },
+        ]
+
+        def parse_response(content: str) -> RubricSpec:
+            payload = _parse_json_object(content)
+            payload = payload.get("rubric_spec", payload)
+            if not isinstance(payload, dict):
+                raise ValueError("rubric generator output is not an object")
+            payload["task_id"] = task_spec.task_id
+            payload.setdefault("rubric_id", "%s_rubric" % task_spec.task_id)
+            payload.setdefault("version", task_spec.version)
+            return RubricSpec(**payload)
+
+        return self._generate_structured_response(
+            messages=messages,
+            prompt_id="rubric_generator_v1",
+            repair_prompt_id="rubric_generator_json_repair_v1",
+            repair_stage="rubric_generator",
+            minimum_repair_tokens=6000,
+            parse_response=parse_response,
         )
-        payload = _parse_json_object(response.content)
-        payload = payload.get("rubric_spec", payload)
-        if not isinstance(payload, dict):
-            raise ValueError("rubric generator output is not an object")
-        payload["task_id"] = task_spec.task_id
-        payload.setdefault("rubric_id", "%s_rubric" % task_spec.task_id)
-        payload.setdefault("version", task_spec.version)
-        return RubricSpec(**payload)
 
 
-class ModelReportGeneratorAdapter:
+class ModelReportGeneratorAdapter(_TrackedModelAdapter):
     def __init__(
         self,
         config: ProviderModelConfig,
@@ -288,6 +411,7 @@ class ModelReportGeneratorAdapter:
     ):
         self.config = config
         self.model_provider = model_provider or OpenAICompatibleProvider()
+        self._init_model_call_tracker(config)
 
     def write(
         self,
@@ -297,6 +421,7 @@ class ModelReportGeneratorAdapter:
         results: list[EvaluationResult],
         input_data_summary: dict[str, object],
     ) -> Report:
+        self._record_model_call("report_generator_v1")
         response = self.model_provider.generate(
             [
                 _report_generator_system_message(),
@@ -485,6 +610,9 @@ def create_run_payload(request: Any) -> dict[str, object]:
             minimum_scenarios=request.minimum_scenarios,
             input_data=request.input_data,
             selected_scenario_ids=request.selected_scenario_ids,
+            confirmed_task_spec=getattr(request, "task_spec", None),
+            confirmed_rubric_spec=getattr(request, "rubric_spec", None),
+            confirmed_scenario_set=getattr(request, "scenario_set", None),
             model_config_summary=summary,
             stage_model_config_summary=stage_summary,
             run_context=context,
@@ -524,8 +652,27 @@ def create_run_payload(request: Any) -> dict[str, object]:
     return engine_app._run_response_payload(result, summary, context)
 
 
-def submit_run_payload(request: Any) -> dict[str, object]:
+def submit_run_payload(
+    request: Any,
+    *,
+    source_ip: str = "",
+) -> dict[str, object]:
     run_id = _new_run_id()
+    settings = settings_from_env()
+    if settings.environment.lower() == "production":
+        queue = job_queue(require_redis=True)
+        if hasattr(request, "model_dump"):
+            payload = request.model_dump(mode="json", by_alias=True)
+        else:
+            payload = _request_payload(request)
+        queue.submit(source_ip or "unknown", run_id, payload)
+        return {
+            "run_id": run_id,
+            "status": "queued",
+            "status_url": "/api/runs/%s/status" % run_id,
+            "result_url": "/api/runs/%s" % run_id,
+        }
+
     status_store = run_status_store()
     if status_store is not None:
         status_store.set_status(
@@ -544,6 +691,28 @@ def submit_run_payload(request: Any) -> dict[str, object]:
 
 
 def _run_async_job(request: Any, run_id: str) -> None:
+    try:
+        _execute_run_job(request, run_id)
+    except Exception as exc:
+        status_store = run_status_store()
+        if status_store is not None:
+            status_store.set_status(
+                run_id,
+                status="failed",
+                current_stage="failed",
+                stages=_status_stages("failed", "failed"),
+                error=str(exc),
+            )
+
+
+def execute_queued_run(payload: dict[str, object], run_id: str) -> None:
+    from backend.eval_agent.api.routes.runs import RunRequest
+
+    request = RunRequest.model_validate(payload)
+    _execute_run_job(request, run_id)
+
+
+def _execute_run_job(request: Any, run_id: str) -> None:
     status_store = run_status_store()
     if status_store is not None:
         status_store.set_status(
@@ -556,47 +725,39 @@ def _run_async_job(request: Any, run_id: str) -> None:
     summary = model_config_summary(stage_configs["target_model"])
     stage_summary = stage_model_config_summary(stage_configs)
     context = run_context(request)
-    try:
-        run_full_evaluation(
-            run_id=run_id,
-            progress_callback=_progress_callback(status_store, run_id),
-            scenario_concurrency=settings_from_env().scenario_concurrency,
-            scenario_batch_size=settings_from_env().scenario_batch_size,
-            raw_instruction=request.instruction,
-            run_root=artifact_root(),
-            assistant_provider=build_assistant_provider(stage_configs["target_model"]),
-            user_provider=build_user_provider(stage_configs["user_simulator"]),
-            minimum_scenarios=request.minimum_scenarios,
-            input_data=request.input_data,
-            selected_scenario_ids=request.selected_scenario_ids,
-            model_config_summary=summary,
-            stage_model_config_summary=stage_summary,
-            run_context=context,
-            judge_provider=build_semantic_judge_provider(stage_configs["semantic_judge"]),
-            scenario_provider=build_scenario_generator_provider(
-                stage_configs["scenario_generator"]
-            ),
-            parser_provider=build_instruction_parser_provider(
-                stage_configs["instruction_parser"]
-            ),
-            rubric_provider=build_rubric_generator_provider(
-                stage_configs["rubric_generator"]
-            ),
-            report_provider=build_report_generator_provider(
-                stage_configs["report_generator"]
-            ),
-            quality_auto_repair=_quality_auto_repair_enabled(stage_configs),
-        )
-    except Exception as exc:
-        if status_store is not None:
-            status_store.set_status(
-                run_id,
-                status="failed",
-                current_stage="failed",
-                stages=_status_stages("failed", "failed"),
-                error=str(exc),
-            )
-        return
+    run_full_evaluation(
+        run_id=run_id,
+        progress_callback=_progress_callback(status_store, run_id),
+        scenario_concurrency=settings_from_env().scenario_concurrency,
+        scenario_batch_size=settings_from_env().scenario_batch_size,
+        raw_instruction=request.instruction,
+        run_root=artifact_root(),
+        assistant_provider=build_assistant_provider(stage_configs["target_model"]),
+        user_provider=build_user_provider(stage_configs["user_simulator"]),
+        minimum_scenarios=request.minimum_scenarios,
+        input_data=request.input_data,
+        selected_scenario_ids=request.selected_scenario_ids,
+        confirmed_task_spec=getattr(request, "task_spec", None),
+        confirmed_rubric_spec=getattr(request, "rubric_spec", None),
+        confirmed_scenario_set=getattr(request, "scenario_set", None),
+        model_config_summary=summary,
+        stage_model_config_summary=stage_summary,
+        run_context=context,
+        judge_provider=build_semantic_judge_provider(stage_configs["semantic_judge"]),
+        scenario_provider=build_scenario_generator_provider(
+            stage_configs["scenario_generator"]
+        ),
+        parser_provider=build_instruction_parser_provider(
+            stage_configs["instruction_parser"]
+        ),
+        rubric_provider=build_rubric_generator_provider(
+            stage_configs["rubric_generator"]
+        ),
+        report_provider=build_report_generator_provider(
+            stage_configs["report_generator"]
+        ),
+        quality_auto_repair=_quality_auto_repair_enabled(stage_configs),
+    )
     if status_store is not None:
         status_store.set_status(
             run_id,
@@ -664,6 +825,65 @@ def run_status_store() -> Any:
         ttl_seconds=settings.run_status_ttl_seconds,
     )
     return RUN_STATUS_STORE
+
+
+def job_queue(*, require_redis: bool = False) -> RedisJobQueue:
+    global JOB_QUEUE
+    if JOB_QUEUE is not None:
+        return JOB_QUEUE
+    settings = settings_from_env()
+    try:
+        client = redis_client_from_url(settings.redis_url)
+        client.ping()
+    except Exception as exc:
+        if require_redis:
+            raise JobQueueUnavailable("Job queue is unavailable") from exc
+        raise
+    JOB_QUEUE = RedisJobQueue(
+        client,
+        runs_per_ip_per_hour=settings.runs_per_ip_per_hour,
+        max_queued_runs=settings.max_queued_runs,
+        job_timeout_seconds=settings.run_job_timeout_seconds,
+        status_ttl_seconds=settings.run_status_ttl_seconds,
+    )
+    return JOB_QUEUE
+
+
+def _request_payload(request: Any) -> dict[str, object]:
+    model_config = getattr(request, "eval_model_config", None)
+    return {
+        "instruction": getattr(request, "instruction", ""),
+        "input_data": getattr(request, "input_data", ""),
+        "minimum_scenarios": getattr(request, "minimum_scenarios", 5),
+        "model_config": {
+            "provider": getattr(model_config, "provider", "mock"),
+            "model_name": getattr(model_config, "model_name", ""),
+            "api_base": getattr(model_config, "api_base", ""),
+            "api_key": getattr(model_config, "api_key", ""),
+            "judge_mode": getattr(model_config, "judge_mode", "hybrid"),
+            "temperature": getattr(model_config, "temperature", None),
+            "max_tokens": getattr(model_config, "max_tokens", None),
+        },
+        "selected_scenario_ids": getattr(request, "selected_scenario_ids", []),
+        "task_spec": _json_model_payload(getattr(request, "task_spec", None)),
+        "rubric_spec": _json_model_payload(getattr(request, "rubric_spec", None)),
+        "scenario_set": _json_model_payload(getattr(request, "scenario_set", None)),
+        "workspace_id": getattr(request, "workspace_id", "workspace_demo"),
+        "project_id": getattr(
+            request,
+            "project_id",
+            "project_meituan_fulfillment",
+        ),
+        "created_by": getattr(request, "created_by", "demo_user"),
+    }
+
+
+def _json_model_payload(value: Any) -> object:
+    if value is None:
+        return None
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    return value
 
 
 def _new_run_id() -> str:
@@ -894,7 +1114,11 @@ def _system_message(task_spec: TaskSpec) -> dict[str, str]:
             "FAQ：\n%s\n"
             "按required_steps顺序推进；遇到用户不确定、拒绝、忙碌、地址异常或信息缺失时，先确认再推进。\n"
             "不得编造未提供的政策、补贴、承诺或订单信息；无法确认时应说明边界并请求核实。\n"
-            "回复应简洁，保持外呼口吻；只有任务已满足或安全终止时才可追加 <DONE>。"
+            "回复应简洁，保持外呼口吻。\n"
+            "只有最近一条 user_simulator 回复包含 <END_CONVERSATION>，表示用户明确结束时，"
+            "才可在自然收尾回复后追加 <DONE>。\n"
+            "用户仍有疑问、仍在补充信息或尚未明确结束时，不得提前输出 <DONE>，"
+            "应继续推进 required_steps；不得向用户解释控制标记。"
         )
         % (
             getattr(task_spec, "role", ""),
@@ -928,7 +1152,10 @@ def _user_simulator_system_message(scenario: Scenario) -> dict[str, str]:
             "初始意图：%s\n"
             "测试重点：%s\n"
             "根据用户画像、difficulty和覆盖目标逐步施压或配合，保持同一人设和态度。\n"
-            "不要替助手完成任务，不要主动提供助手未问到的关键信息，不要解释你的策略。"
+            "按场景逐步回应，不要为了缩短评测而提前结束。\n"
+            "只有达到真实结束状态时，才在自然用户话语末尾追加 <END_CONVERSATION>。\n"
+            "除错号、立即挂断、明确拒绝继续等天然终局外，第一句用户回复不得追加结束标记。\n"
+            "不要替助手完成任务，不要主动提供助手未问到的关键信息，不要解释你的策略或控制标记。"
         )
         % (
             scenario.scenario_id,
@@ -1021,7 +1248,8 @@ def _report_generator_system_message() -> dict[str, str]:
         "content": (
             "你是复杂指令多轮对话评测系统的报告撰写器。"
             "输出中文Markdown报告。不得改写输入中的量化分数、通过率、失败项数量。"
-            "报告必须包含阶段概览、关键失败、证据链、风险分层和可落地优化建议。"
+            "报告必须使用二级标题“## 量化结果”和“## 证据链”，"
+            "并包含阶段概览、关键失败、风险分层和可落地优化建议。"
             "如evidence_compaction显示有遗漏证据，必须说明遗漏证据数量，不得补写未提供的对话。"
         ),
     }
@@ -1116,7 +1344,9 @@ def _report_generator_user_message(
             "instruction": "基于以下不可更改的量化结果，生成解释性Markdown报告。",
             "report_requirements": [
                 "不得改写locked_metrics中的任何数值",
-                "包含阶段概览、关键失败、证据链、风险分层和下一步优化建议",
+                "必须原样包含二级标题：## 量化结果",
+                "必须原样包含二级标题：## 证据链",
+                "包含阶段概览、关键失败、风险分层和下一步优化建议",
                 "引用证据时仅使用EvaluationResults中提供的内容",
                 "如存在omitted_evidence_items，说明遗漏证据数量和报告局限",
             ],
@@ -1221,6 +1451,20 @@ def _scenario_generator_user_message(
             "TaskSpec": task_spec.model_dump(mode="json"),
             "Rubric": rubric.model_dump(mode="json"),
             "input_data": input_data,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _structured_json_repair_message(stage: str, error: Exception) -> str:
+    return json.dumps(
+        {
+            "instruction": (
+                "上一个回答不是合法、完整的JSON。请根据前文要求重新生成完整结果，"
+                "只输出一个JSON对象，不要解释，不要使用Markdown代码块。"
+            ),
+            "stage": stage,
+            "parse_error": "%s: %s" % (type(error).__name__, str(error)),
         },
         ensure_ascii=False,
     )

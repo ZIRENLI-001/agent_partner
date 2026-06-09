@@ -63,7 +63,12 @@ def redis_client_from_url(redis_url: str):
         from redis import Redis
     except ImportError as exc:
         raise RuntimeError("redis package is not installed") from exc
-    return Redis.from_url(redis_url, decode_responses=True)
+    return Redis.from_url(
+        redis_url,
+        decode_responses=True,
+        socket_connect_timeout=5,
+        socket_timeout=10,
+    )
 
 
 class MemoryRunStatusStore:

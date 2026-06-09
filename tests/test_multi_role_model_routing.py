@@ -167,6 +167,47 @@ def test_user_simulator_model_adapter_uses_its_own_model_config():
     assert content == "我现在不想配送。"
     assert model_provider.calls[0]["config"].model_name == "openrouter/user-sim"
     assert "refusal_to_deliver" in model_provider.calls[0]["messages"][0]["content"]
+    diagnostic = user_provider.model_call_diagnostic()
+    assert diagnostic["model_name"] == "openrouter/user-sim"
+    assert diagnostic["prompt_ids"] == {"user_simulator_v1": 1}
+    assert diagnostic["model_call_count"] == 1
+    assert "sk-user" not in json.dumps(diagnostic, ensure_ascii=False)
+
+
+def test_target_model_adapter_records_its_prompt_and_model():
+    from backend.eval_agent.api.routes.runs import ModelConfig
+    from backend.eval_agent.services.run_service import build_assistant_provider
+    from backend.evaluation_engine.domain import TaskSpec
+
+    model_provider = RecordingModelProvider(content="合同已经生效。<DONE>")
+    assistant_provider = build_assistant_provider(
+        ModelConfig(
+            provider="openrouter",
+            model_name="openai/gpt-4.1-mini",
+            api_base="https://openrouter.ai/api/v1",
+            api_key="sk-target",
+        ),
+        model_provider=model_provider,
+    )
+
+    content = assistant_provider.generate(
+        TaskSpec(
+            task_id="task_001",
+            task_name="合同通知",
+            role="合同通知专员",
+            target_user="用户",
+            task_goal="告知合同已生效",
+            opening_line="您好",
+        ),
+        history=[],
+    )
+
+    assert content == "合同已经生效。<DONE>"
+    diagnostic = assistant_provider.model_call_diagnostic()
+    assert diagnostic["model_name"] == "openai/gpt-4.1-mini"
+    assert diagnostic["prompt_ids"] == {"target_dialogue_v1": 1}
+    assert diagnostic["model_call_count"] == 1
+    assert "sk-target" not in json.dumps(diagnostic, ensure_ascii=False)
 
 
 def test_user_simulator_history_is_transcript_not_chat_assistant_memory():
@@ -337,6 +378,11 @@ def test_semantic_judge_model_adapter_batches_rubric_items_in_one_model_call():
     assert [item.score for item in evidence] == [10, 0]
     assert model_provider.calls[0]["config"].max_tokens == 3000
     assert "rubric_items" in model_provider.calls[0]["messages"][1]["content"]
+    diagnostic = judge_provider.model_call_diagnostic()
+    assert diagnostic["model_name"] == "openrouter/judge"
+    assert diagnostic["prompt_ids"] == {"semantic_judge_batch_v1": 1}
+    assert diagnostic["model_call_count"] == 1
+    assert "sk-judge" not in json.dumps(diagnostic, ensure_ascii=False)
 
 
 def test_semantic_judge_batch_missing_item_is_retried_with_single_item_judge():

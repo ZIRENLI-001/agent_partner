@@ -107,7 +107,7 @@ class RunConfig(BaseModel):
     target_model: str = "fake-target"
     user_model: str = "fake-user"
     judge_model: str = "heuristic-judge"
-    max_turns: int = 8
+    max_turns: int = 17
 
 
 class Report(BaseModel):

@@ -8,10 +8,22 @@ export interface StageRequest {
 
 export interface Scenario {
   scenario_id: string;
+  task_id?: string;
   user_profile: Record<string, string>;
   coverage_targets: string[];
   initial_user_intent: string;
   expected_test_focus: string;
+  difficulty?: string;
+  scenario_type?: string;
+  expected_behavior?: string;
+  risk_tags?: string[];
+}
+
+export interface ScenarioSetPayload {
+  suite_id?: string;
+  task_id?: string;
+  version?: string;
+  scenarios: Scenario[];
 }
 
 export interface ParseStageResponse {
@@ -32,9 +44,7 @@ export interface ScenariosStageResponse {
   stage: "scenarios";
   task_spec: Record<string, unknown>;
   rubric_spec: Record<string, unknown>;
-  scenario_set: {
-    scenarios: Scenario[];
-  };
+  scenario_set: ScenarioSetPayload;
   evaluation_strategy?: Record<string, unknown>;
 }
 

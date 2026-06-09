@@ -139,9 +139,7 @@ export function EvaluationWizardPage() {
     description: stageDescriptions[item.key],
     status: wizardStepProgressStatus(item.key, index)
   }));
-  const selectedScenarios = selectedScenarioIds.length
-    ? selectedScenarioIds
-    : scenarios.map((scenario) => scenario.scenario_id);
+  const selectedScenarios = selectedScenarioIds;
 
   const stagePayload = useMemo(
     () => ({
@@ -343,12 +341,28 @@ export function EvaluationWizardPage() {
         return;
       }
       if (activeStep === "run") {
+        if (!parseResult || !rubricResult || !scenarioResult) {
+          throw new Error("Please generate parse, rubric, and scenarios before running.");
+        }
+        const selectedScenarioSet = new Set(selectedScenarios);
+        const confirmedScenarioSet = {
+          ...scenarioResult.scenario_set,
+          scenarios: scenarioResult.scenario_set.scenarios.filter((scenario) =>
+            selectedScenarioSet.has(scenario.scenario_id)
+          )
+        };
+        if (!confirmedScenarioSet.scenarios.length) {
+          throw new Error("No selected scenarios are available for evaluation.");
+        }
         setRunStatus(undefined);
         const submitted = await submitRun({
           instruction,
           input_data: stagePayload.input_data,
           minimum_scenarios: minimumScenarios,
-          selected_scenario_ids: selectedScenarios,
+          selected_scenario_ids: confirmedScenarioSet.scenarios.map((scenario) => scenario.scenario_id),
+          task_spec: parseResult.task_spec,
+          rubric_spec: rubricResult.rubric_spec,
+          scenario_set: confirmedScenarioSet,
           model_config: {
             provider,
             model_name: modelName,

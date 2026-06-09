@@ -1,6 +1,35 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
+
+
+GENERATED_RUN_ID_PATTERN = re.compile(r"^run_[0-9a-f]{8}$")
+
+
+def safe_run_dir(
+    root: str | Path,
+    run_id: str,
+    *,
+    create: bool = False,
+    require_generated_id: bool = False,
+) -> Path:
+    if (
+        not run_id
+        or run_id in {".", ".."}
+        or "/" in run_id
+        or "\\" in run_id
+        or (require_generated_id and not GENERATED_RUN_ID_PATTERN.fullmatch(run_id))
+    ):
+        raise ValueError("Invalid artifact path")
+
+    resolved_root = Path(root).resolve()
+    path = (resolved_root / run_id).resolve()
+    if path.parent != resolved_root:
+        raise ValueError("Invalid artifact path")
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 class ArtifactStore:
@@ -9,11 +38,7 @@ class ArtifactStore:
         self.root.mkdir(parents=True, exist_ok=True)
 
     def run_dir(self, run_id: str) -> Path:
-        if "/" in run_id or "\\" in run_id or run_id in {"", ".", ".."}:
-            raise ValueError("Invalid artifact path")
-        path = self.root / run_id
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+        return safe_run_dir(self.root, run_id, create=True)
 
     def artifact_path(self, run_id: str, filename: str) -> Path:
         if "/" in filename or "\\" in filename or filename in {"", ".", ".."}:

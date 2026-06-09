@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from backend.evaluation_engine.domain import (
     DialogueTrace,
     EvaluationResult,
@@ -10,9 +12,11 @@ from backend.evaluation_engine.domain import (
     Report,
     Scenario,
     ScenarioSet,
+    TaskSpec,
     Turn,
 )
 from backend.evaluation_engine.engine import (
+    _attach_model_call_diagnostics,
     merge_evaluation_results,
     rubric_for_scenario,
     run_full_evaluation,
@@ -41,6 +45,260 @@ RAW_TASK = """# Role
 - 每次回复控制在约 30 个字以内。
 - 如被问及超出职责范围的问题，回复确认后再回电。
 """
+
+
+def _confirmed_stage_artifacts() -> tuple[TaskSpec, RubricSpec, ScenarioSet]:
+    task_spec = TaskSpec(
+        task_id="task_confirmed",
+        task_name="Confirmed staged task",
+        role="Contract specialist",
+        target_user="Contract user",
+        task_goal="Confirm the contract status",
+        opening_line="Hello, I am calling about your contract.",
+        required_steps=["Confirm the contract is active"],
+    )
+    rubric = RubricSpec(
+        rubric_id="rubric_confirmed",
+        task_id=task_spec.task_id,
+        items=[
+            RubricItem(
+                item_id="confirmed_item",
+                dimension="task_completion",
+                criterion="Confirms the contract is active",
+                source="required_steps",
+                check_type="rule",
+                weight=10,
+            )
+        ],
+    )
+    scenarios = ScenarioSet(
+        suite_id="suite_confirmed",
+        task_id=task_spec.task_id,
+        scenarios=[
+            Scenario(
+                scenario_id="confirmed_scene",
+                task_id=task_spec.task_id,
+                user_profile={"attitude": "neutral"},
+                coverage_targets=["confirmed_item"],
+                initial_user_intent="Ask whether the contract is active",
+                expected_test_focus="Contract confirmation",
+            )
+        ],
+    )
+    return task_spec, rubric, scenarios
+
+
+class TerminationProtocolAssistant:
+    def __init__(self):
+        self.replies = iter(
+            [
+                "Hello.",
+                "Let me provide the remaining details.<DONE>",
+                "Understood, goodbye.<DONE>",
+            ]
+        )
+
+    def generate(self, task_spec, history):
+        return next(self.replies)
+
+
+class TerminationProtocolUser:
+    def __init__(self):
+        self.replies = iter(
+            [
+                "I still need more details.",
+                "That answers my question.<END_CONVERSATION>",
+            ]
+        )
+
+    def generate(self, scenario, history):
+        return next(self.replies)
+
+
+class SingleScenarioProvider:
+    def generate(self, task_spec, rubric, input_data, minimum):
+        return ScenarioSet(
+            suite_id="suite_protocol",
+            task_id=task_spec.task_id,
+            scenarios=[
+                Scenario(
+                    scenario_id="scenario_protocol",
+                    task_id=task_spec.task_id,
+                    user_profile={"attitude": "neutral"},
+                    coverage_targets=["task_completion"],
+                    initial_user_intent="Ask for details",
+                    expected_test_focus="Explicit dialogue termination",
+                )
+            ],
+        )
+
+
+@pytest.mark.parametrize("use_confirmed_artifacts", [False, True])
+def test_run_full_evaluation_uses_shared_termination_protocol(
+    tmp_path: Path,
+    use_confirmed_artifacts: bool,
+):
+    kwargs = {}
+    if use_confirmed_artifacts:
+        task_spec, rubric, scenarios = _confirmed_stage_artifacts()
+        scenarios.scenarios[0].scenario_id = "scenario_protocol"
+        kwargs = {
+            "confirmed_task_spec": task_spec,
+            "confirmed_rubric_spec": rubric,
+            "confirmed_scenario_set": scenarios,
+        }
+
+    run = run_full_evaluation(
+        raw_instruction=RAW_TASK,
+        run_root=tmp_path,
+        assistant_provider=TerminationProtocolAssistant(),
+        user_provider=TerminationProtocolUser(),
+        minimum_scenarios=1,
+        scenario_provider=None if use_confirmed_artifacts else SingleScenarioProvider(),
+        quality_auto_repair=False,
+        **kwargs,
+    )
+
+    trace = run.traces[0]
+    assert len(trace.turns) == 5
+    assert trace.termination_reason == "task_completed"
+    assert all(
+        "<DONE>" not in turn.content
+        and "<END_CONVERSATION>" not in turn.content
+        for turn in trace.turns
+    )
+    if use_confirmed_artifacts:
+        for stage in (
+            "instruction_parsing",
+            "rubric_generation",
+            "scenario_generation",
+        ):
+            assert run.stage_diagnostics[stage]["output_source"] == (
+                "confirmed_stage_artifact"
+            )
+
+
+def test_run_full_evaluation_reuses_confirmed_stage_artifacts(tmp_path: Path):
+    class UnexpectedParser:
+        def parse(self, *args, **kwargs):
+            raise AssertionError("parser should not be called")
+
+    class UnexpectedRubricGenerator:
+        def build(self, *args, **kwargs):
+            raise AssertionError("rubric generator should not be called")
+
+    class UnexpectedScenarioGenerator:
+        def generate(self, *args, **kwargs):
+            raise AssertionError("scenario generator should not be called")
+
+    task_spec, rubric, scenarios = _confirmed_stage_artifacts()
+
+    run = run_full_evaluation(
+        raw_instruction=RAW_TASK,
+        run_root=tmp_path,
+        assistant_provider=FakeAssistantProvider(),
+        user_provider=FakeUserProvider(),
+        selected_scenario_ids=["confirmed_scene"],
+        parser_provider=UnexpectedParser(),
+        rubric_provider=UnexpectedRubricGenerator(),
+        scenario_provider=UnexpectedScenarioGenerator(),
+        confirmed_task_spec=task_spec,
+        confirmed_rubric_spec=rubric,
+        confirmed_scenario_set=scenarios,
+        quality_auto_repair=False,
+    )
+
+    assert run.task_spec.task_id == "task_confirmed"
+    assert run.rubric_spec.rubric_id == "rubric_confirmed"
+    assert [item.scenario_id for item in run.scenario_set.scenarios] == [
+        "confirmed_scene"
+    ]
+    assert run.stage_diagnostics["instruction_parsing"]["output_source"] == (
+        "confirmed_stage_artifact"
+    )
+    assert run.stage_diagnostics["rubric_generation"]["output_source"] == (
+        "confirmed_stage_artifact"
+    )
+    assert run.stage_diagnostics["scenario_generation"]["output_source"] == (
+        "confirmed_stage_artifact"
+    )
+
+
+def test_run_full_evaluation_rejects_stale_selected_scenario_ids(tmp_path: Path):
+    task_spec, rubric, scenarios = _confirmed_stage_artifacts()
+
+    with pytest.raises(ValueError, match="selected scenarios"):
+        run_full_evaluation(
+            raw_instruction=RAW_TASK,
+            run_root=tmp_path,
+            assistant_provider=FakeAssistantProvider(),
+            user_provider=FakeUserProvider(),
+            selected_scenario_ids=["stale_preview_scene"],
+            confirmed_task_spec=task_spec,
+            confirmed_rubric_spec=rubric,
+            confirmed_scenario_set=scenarios,
+            quality_auto_repair=False,
+        )
+
+
+def test_model_call_diagnostics_are_attached_to_their_actual_stages():
+    class Provider:
+        def __init__(self, role):
+            self.role = role
+
+        def model_call_diagnostic(self):
+            return {
+                "provider": "openrouter",
+                "model_name": "%s-model" % self.role,
+                "prompt_ids": {"%s_prompt_v1" % self.role: 1},
+                "model_call_count": 1,
+                "retry_count": 0,
+            }
+
+    diagnostics = {}
+    providers = {
+        role: Provider(role)
+        for role in (
+            "target_model",
+            "user_simulator",
+            "semantic_judge",
+            "scenario_generator",
+            "instruction_parser",
+            "rubric_generator",
+            "report_generator",
+        )
+    }
+
+    _attach_model_call_diagnostics(
+        diagnostics,
+        assistant_provider=providers["target_model"],
+        user_provider=providers["user_simulator"],
+        judge_provider=providers["semantic_judge"],
+        scenario_provider=providers["scenario_generator"],
+        parser_provider=providers["instruction_parser"],
+        rubric_provider=providers["rubric_generator"],
+        report_provider=providers["report_generator"],
+    )
+
+    assert diagnostics["instruction_parsing"]["model_call"]["model_name"] == (
+        "instruction_parser-model"
+    )
+    assert diagnostics["rubric_generation"]["model_call"]["model_name"] == (
+        "rubric_generator-model"
+    )
+    assert diagnostics["scenario_generation"]["model_call"]["model_name"] == (
+        "scenario_generator-model"
+    )
+    assert diagnostics["report_generation"]["model_call"]["model_name"] == (
+        "report_generator-model"
+    )
+    execution_calls = diagnostics["scenario_execution"]["model_calls"]
+    assert set(execution_calls) == {
+        "target_model",
+        "user_simulator",
+        "semantic_judge",
+    }
+    assert "api_key" not in json.dumps(diagnostics, ensure_ascii=False)
 
 
 def test_run_full_evaluation_persists_multi_scenario_run(tmp_path: Path):
@@ -242,30 +500,122 @@ class FailingScenarioProvider:
         raise RuntimeError("scenario generator timeout")
 
 
-class BrokenReportProvider:
+class RecoveringReportProvider:
+    def __init__(self):
+        self.call_count = 0
+
     def write(self, run_id, task_spec, scenario_set, results, input_data_summary):
+        self.call_count += 1
+        if self.call_count == 1:
+            return Report(
+                run_id=run_id,
+                task_id=task_spec.task_id,
+                markdown="# 模型报告\n\n只有解释，没有量化结果和证据链。",
+            )
         return Report(
             run_id=run_id,
             task_id=task_spec.task_id,
-            markdown="# 模型报告\n\n只有解释，没有量化结果和证据链。",
+            markdown="# 模型报告\n\n## 量化结果\n\n总分准确。\n\n## 证据链\n\n证据完整。",
         )
 
 
 def test_run_full_evaluation_auto_repairs_failed_quality_gate_once(tmp_path: Path):
+    report_provider = RecoveringReportProvider()
     run = run_full_evaluation(
         raw_instruction=RAW_TASK,
         run_root=tmp_path,
         assistant_provider=FakeAssistantProvider(),
         user_provider=FakeUserProvider(),
         minimum_scenarios=2,
-        report_provider=BrokenReportProvider(),
+        report_provider=report_provider,
     )
 
+    assert report_provider.call_count == 2
     assert run.quality_summary["report_integrity"]["missing_sections"] == []
     assert run.quality_summary["auto_repair"]["attempted"] is True
     assert run.quality_summary["auto_repair"]["attempt_count"] == 1
     assert run.quality_summary["auto_repair"]["actions"][0]["stage"] == "report"
     assert "## 量化结果" in run.report.markdown
+    assert run.stage_diagnostics["report_generation"]["output_source"] == "model"
+    assert run.stage_diagnostics["report_generation"]["fallback_used"] is False
+
+
+def test_report_auto_repair_falls_back_only_after_second_invalid_model_report(
+    tmp_path: Path,
+):
+    class AlwaysInvalidReportProvider:
+        def __init__(self):
+            self.call_count = 0
+
+        def write(self, run_id, task_spec, scenario_set, results, input_data_summary):
+            self.call_count += 1
+            return Report(
+                run_id=run_id,
+                task_id=task_spec.task_id,
+                markdown="# 模型报告\n\n仍然缺少质量门禁要求的章节。",
+            )
+
+    report_provider = AlwaysInvalidReportProvider()
+    run = run_full_evaluation(
+        raw_instruction=RAW_TASK,
+        run_root=tmp_path,
+        assistant_provider=FakeAssistantProvider(),
+        user_provider=FakeUserProvider(),
+        minimum_scenarios=2,
+        report_provider=report_provider,
+    )
+
+    assert report_provider.call_count == 2
+    assert "## 量化结果" in run.report.markdown
+    assert "## 证据链" in run.report.markdown
+    diagnostic = run.stage_diagnostics["report_generation"]
+    assert diagnostic["output_source"] == "template_report"
+    assert diagnostic["model_attempted"] is True
+    assert diagnostic["fallback_used"] is True
+    assert diagnostic["fallback_reason"] == (
+        "model report failed integrity check after retry"
+    )
+
+
+def test_report_model_retry_is_persisted_in_stage_diagnostics(tmp_path: Path):
+    from backend.eval_agent.api.routes.runs import ModelConfig
+    from backend.eval_agent.providers.base import ModelResponse
+    from backend.eval_agent.services.run_service import build_report_generator_provider
+
+    class SequentialReportModel:
+        def __init__(self):
+            self.responses = [
+                "# 模型报告\n\n缺少质量门禁章节。",
+                "# 模型报告\n\n## 量化结果\n\n总分准确。\n\n## 证据链\n\n证据完整。",
+            ]
+
+        def generate(self, messages, config):
+            return ModelResponse(content=self.responses.pop(0), raw={"ok": True})
+
+    report_provider = build_report_generator_provider(
+        ModelConfig(
+            provider="openrouter",
+            model_name="openai/gpt-4.1-mini",
+            api_base="https://openrouter.ai/api/v1",
+            api_key="sk-report",
+        ),
+        model_provider=SequentialReportModel(),
+    )
+    run = run_full_evaluation(
+        raw_instruction=RAW_TASK,
+        run_root=tmp_path,
+        assistant_provider=FakeAssistantProvider(),
+        user_provider=FakeUserProvider(),
+        minimum_scenarios=2,
+        report_provider=report_provider,
+    )
+
+    diagnostic = run.stage_diagnostics["report_generation"]["model_call"]
+    assert diagnostic["model_name"] == "openai/gpt-4.1-mini"
+    assert diagnostic["prompt_ids"] == {"report_generator_v1": 2}
+    assert diagnostic["model_call_count"] == 2
+    assert diagnostic["retry_count"] == 1
+    assert "sk-report" not in json.dumps(diagnostic, ensure_ascii=False)
 
 
 def test_run_full_evaluation_uses_injected_scenario_generator(tmp_path: Path):

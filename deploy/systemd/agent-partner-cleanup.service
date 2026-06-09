@@ -1,0 +1,17 @@
+[Unit]
+Description=Remove expired Agent Partner run artifacts
+
+[Service]
+Type=oneshot
+User=agent-partner
+Group=agent-partner
+WorkingDirectory=/srv/agent_partner/app
+EnvironmentFile=/etc/agent-partner/agent-partner.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/srv/agent_partner/app/.venv/bin/python -m scripts.cleanup_artifacts
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/agent_partner/runs
+UMask=0027

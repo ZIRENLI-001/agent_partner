@@ -1,4 +1,4 @@
-import { ApiError } from "./client";
+import { accessTokenHeaders, ApiError, promptForAccessToken } from "./client";
 
 export interface ImportedEvaluationRow {
   caseName: string;
@@ -16,10 +16,18 @@ export async function uploadEvaluationRows(file: File): Promise<EvaluationRowsIm
   const formData = new FormData();
   formData.append("file", file);
 
-  const response = await fetch("/api/import/evaluation-rows", {
+  let response = await fetch("/api/import/evaluation-rows", {
     method: "POST",
-    body: formData
+    body: formData,
+    headers: accessTokenHeaders()
   });
+  if (response.status === 401 && promptForAccessToken()) {
+    response = await fetch("/api/import/evaluation-rows", {
+      method: "POST",
+      body: formData,
+      headers: accessTokenHeaders()
+    });
+  }
 
   if (!response.ok) {
     const text = await response.text();
@@ -30,7 +38,14 @@ export async function uploadEvaluationRows(file: File): Promise<EvaluationRowsIm
 }
 
 export async function fetchMockEvaluationRows(): Promise<EvaluationRowsImportResponse> {
-  const response = await fetch("/api/import/mock-evaluation-rows");
+  let response = await fetch("/api/import/mock-evaluation-rows", {
+    headers: accessTokenHeaders()
+  });
+  if (response.status === 401 && promptForAccessToken()) {
+    response = await fetch("/api/import/mock-evaluation-rows", {
+      headers: accessTokenHeaders()
+    });
+  }
 
   if (!response.ok) {
     const text = await response.text();

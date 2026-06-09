@@ -1,5 +1,10 @@
 from typing import Optional
 
+from backend.evaluation_engine.dialogue_protocol import (
+    ASSISTANT_DONE_MARKER,
+    USER_END_MARKER,
+    parse_controlled_text,
+)
 from backend.evaluation_engine.dialogue_runner import run_dialogue
 from backend.evaluation_engine.domain import RunConfig, Scenario, TaskSpec, Turn
 from backend.evaluation_engine.providers import FakeAssistantProvider, FakeUserProvider
@@ -31,6 +36,185 @@ def _scenario(
         coverage_targets=coverage_targets or ["normal_completion"],
         initial_user_intent=initial_user_intent,
         expected_test_focus="基础任务完成",
+    )
+
+
+def test_run_config_defaults_to_eight_complete_interaction_rounds():
+    config = RunConfig(run_id="run_default", task_id="task_001")
+
+    assert config.max_turns == 17
+
+
+def test_parse_controlled_text_strips_both_markers_but_only_accepts_expected_role():
+    content, signaled = parse_controlled_text(
+        "Okay, goodbye.<END_CONVERSATION><DONE>",
+        expected_marker=USER_END_MARKER,
+    )
+
+    assert content == "Okay, goodbye."
+    assert signaled is True
+
+    content, signaled = parse_controlled_text(
+        "Understood.<END_CONVERSATION>",
+        expected_marker=ASSISTANT_DONE_MARKER,
+    )
+
+    assert content == "Understood."
+    assert signaled is False
+
+
+class SequenceAssistantProvider:
+    def __init__(self, replies: list[str]):
+        self.replies = iter(replies)
+
+    def generate(self, task_spec: TaskSpec, history: list[Turn]) -> str:
+        return next(self.replies)
+
+
+class SequenceUserProvider:
+    def __init__(self, replies: list[str]):
+        self.replies = iter(replies)
+        self.calls = 0
+
+    def generate(self, scenario: Scenario, history: list[Turn]) -> str:
+        self.calls += 1
+        return next(self.replies)
+
+
+def test_early_assistant_done_is_ignored_until_user_signals_end():
+    user = SequenceUserProvider(
+        [
+            "I still have a question.",
+            "Okay, that answers it.<END_CONVERSATION>",
+        ]
+    )
+    trace = run_dialogue(
+        task_spec=_task(),
+        scenario=_scenario(),
+        run_config=RunConfig(
+            run_id="run_early_done",
+            task_id="task_001",
+            max_turns=9,
+        ),
+        assistant_provider=SequenceAssistantProvider(
+            [
+                "Hello.",
+                "Here is a partial answer.<DONE>",
+                "Understood, goodbye.<DONE>",
+            ]
+        ),
+        user_provider=user,
+    )
+
+    assert len(trace.turns) == 5
+    assert trace.termination_reason == "task_completed"
+    assert user.calls == 2
+    assert all(
+        marker not in turn.content
+        for turn in trace.turns
+        for marker in (ASSISTANT_DONE_MARKER, USER_END_MARKER)
+    )
+
+
+def test_terminal_user_gets_one_closing_response_without_another_user_turn():
+    user = SequenceUserProvider(["Please do not call again.<END_CONVERSATION>"])
+    trace = run_dialogue(
+        task_spec=_task(),
+        scenario=_scenario(),
+        run_config=RunConfig(
+            run_id="run_user_ended",
+            task_id="task_001",
+        ),
+        assistant_provider=SequenceAssistantProvider(
+            ["Hello.", "Understood, we will not call again."]
+        ),
+        user_provider=user,
+    )
+
+    assert [turn.speaker for turn in trace.turns] == [
+        "assistant",
+        "user_simulator",
+        "assistant",
+    ]
+    assert trace.termination_reason == "user_ended"
+    assert user.calls == 1
+
+
+def test_terminal_user_marker_is_visible_to_closing_assistant_but_not_persisted():
+    class InspectingAssistantProvider:
+        def __init__(self):
+            self.closing_history: list[Turn] = []
+
+        def generate(self, task_spec: TaskSpec, history: list[Turn]) -> str:
+            if not history:
+                return "Hello."
+            self.closing_history = list(history)
+            return "Understood, goodbye.<DONE>"
+
+    assistant = InspectingAssistantProvider()
+    trace = run_dialogue(
+        task_spec=_task(),
+        scenario=_scenario(),
+        run_config=RunConfig(
+            run_id="run_transient_marker",
+            task_id="task_001",
+        ),
+        assistant_provider=assistant,
+        user_provider=SequenceUserProvider(
+            ["Okay, goodbye.<END_CONVERSATION>"]
+        ),
+    )
+
+    assert assistant.closing_history[-1].content.endswith(USER_END_MARKER)
+    assert all(USER_END_MARKER not in turn.content for turn in trace.turns)
+
+
+def test_default_budget_allows_eight_complete_rounds_and_ends_on_assistant():
+    trace = run_dialogue(
+        task_spec=_task(),
+        scenario=_scenario(),
+        run_config=RunConfig(run_id="run_budget", task_id="task_001"),
+        assistant_provider=SequenceAssistantProvider(
+            ["Hello."] + ["Let me continue."] * 8
+        ),
+        user_provider=SequenceUserProvider(["Please continue."] * 8),
+    )
+
+    assert len(trace.turns) == 17
+    assert trace.turns[-1].speaker == "assistant"
+    assert trace.termination_reason == "max_turns"
+
+
+def test_wrong_role_markers_are_stripped_without_terminating_dialogue():
+    trace = run_dialogue(
+        task_spec=_task(),
+        scenario=_scenario(),
+        run_config=RunConfig(
+            run_id="run_wrong_markers",
+            task_id="task_001",
+            max_turns=5,
+        ),
+        assistant_provider=SequenceAssistantProvider(
+            [
+                "Hello.<END_CONVERSATION>",
+                "Continuing.<END_CONVERSATION>",
+                "Final response.",
+            ]
+        ),
+        user_provider=SequenceUserProvider(
+            [
+                "My first response.<DONE>",
+                "My second response.",
+            ]
+        ),
+    )
+
+    assert len(trace.turns) == 5
+    assert trace.termination_reason == "max_turns"
+    assert all(
+        marker not in turn.content
+        for turn in trace.turns
+        for marker in (ASSISTANT_DONE_MARKER, USER_END_MARKER)
     )
 
 
@@ -89,7 +273,7 @@ def test_assistant_provider_does_not_receive_scenario():
         user_provider=FakeUserProvider(),
     )
 
-    assert trace.termination_reason == "task_completed"
+    assert trace.termination_reason == "max_turns"
 
 
 def test_fake_user_first_turn_uses_initial_user_intent_for_custom_scenario():
@@ -113,6 +297,27 @@ def test_fake_user_first_turn_uses_initial_user_intent_for_custom_scenario():
     )
 
     assert trace.turns[1].content == "这是一个未来补充场景的首轮意图"
+
+
+def test_next_user_turn_preserves_end_marker_after_validating_natural_text():
+    class EndingUserProvider:
+        def generate(self, scenario: Scenario, history: list[Turn]) -> str:
+            return "Okay, I understand.<END_CONVERSATION>"
+
+    result = next_user_turn(EndingUserProvider(), _scenario(), [])
+
+    assert result == "Okay, I understand.<END_CONVERSATION>"
+
+
+def test_marker_only_user_output_uses_natural_fallback_and_keeps_end_signal():
+    class MarkerOnlyUserProvider:
+        def generate(self, scenario: Scenario, history: list[Turn]) -> str:
+            return "<END_CONVERSATION>"
+
+    result = next_user_turn(MarkerOnlyUserProvider(), _scenario(), [])
+
+    assert result.endswith("<END_CONVERSATION>")
+    assert result != "<END_CONVERSATION>"
 
 
 def test_next_user_turn_replaces_assistant_echo_with_natural_user_fallback():

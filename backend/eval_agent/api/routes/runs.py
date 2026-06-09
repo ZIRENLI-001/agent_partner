@@ -2,9 +2,16 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, status
+from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
+from backend.eval_agent.core.config import settings_from_env
+from backend.eval_agent.core.security import trusted_client_ip
+from backend.eval_agent.services.job_queue import (
+    JobQueueFull,
+    JobQueueUnavailable,
+    JobQuotaExceeded,
+)
 from backend.eval_agent.services.run_service import (
     create_run_payload,
     run_comparison_payload,
@@ -13,16 +20,17 @@ from backend.eval_agent.services.run_service import (
     run_status_payload,
     submit_run_payload,
 )
+from backend.evaluation_engine.domain import RubricSpec, ScenarioSet, TaskSpec
 
 router = APIRouter(prefix="/api/runs", tags=["runs"])
 
 
 class ModelConfig(BaseModel):
-    provider: str = "mock"
-    model_name: str = ""
-    api_base: str = ""
-    api_key: str = ""
-    judge_mode: str = "hybrid"
+    provider: str = Field(default="mock", max_length=64)
+    model_name: str = Field(default="", max_length=256)
+    api_base: str = Field(default="", max_length=2048)
+    api_key: str = Field(default="", max_length=4096)
+    judge_mode: str = Field(default="hybrid", max_length=64)
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
 
@@ -30,27 +38,45 @@ class ModelConfig(BaseModel):
 class RunRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
-    instruction: str
-    input_data: str = ""
+    instruction: str = Field(min_length=1, max_length=100_000)
+    input_data: str = Field(default="", max_length=1_000_000)
     minimum_scenarios: int = Field(default=5, ge=1, le=20)
     eval_model_config: ModelConfig = Field(
         default_factory=ModelConfig,
         alias="model_config",
     )
-    selected_scenario_ids: list[str] = Field(default_factory=list)
-    workspace_id: str = "workspace_demo"
-    project_id: str = "project_meituan_fulfillment"
-    created_by: str = "demo_user"
+    selected_scenario_ids: list[str] = Field(default_factory=list, max_length=20)
+    task_spec: Optional[TaskSpec] = None
+    rubric_spec: Optional[RubricSpec] = None
+    scenario_set: Optional[ScenarioSet] = None
+    workspace_id: str = Field(default="workspace_demo", max_length=128)
+    project_id: str = Field(default="project_meituan_fulfillment", max_length=128)
+    created_by: str = Field(default="demo_user", max_length=128)
 
 
 @router.post("")
 def create_run(request: RunRequest) -> dict[str, object]:
+    if settings_from_env().environment.lower() == "production":
+        raise HTTPException(status_code=404, detail="Not found")
     return create_run_payload(request)
 
 
 @router.post("/async", status_code=status.HTTP_202_ACCEPTED)
-def submit_run(request: RunRequest) -> dict[str, object]:
-    return submit_run_payload(request)
+def submit_run(request: RunRequest, http_request: Request) -> dict[str, object]:
+    settings = settings_from_env()
+    source_ip = trusted_client_ip(http_request, settings.trusted_proxy_ips)
+    try:
+        return submit_run_payload(request, source_ip=source_ip)
+    except JobQuotaExceeded as exc:
+        raise HTTPException(
+            status_code=429,
+            detail="Hourly evaluation quota exceeded",
+        ) from exc
+    except (JobQueueFull, JobQueueUnavailable) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Evaluation queue is unavailable",
+        ) from exc
 
 
 @router.get("/history")

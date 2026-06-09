@@ -75,6 +75,21 @@ def test_frontend_api_modules_cover_current_backend_contracts():
     assert "FormData" in imports
 
 
+def test_staged_evaluation_submits_confirmed_stage_artifacts():
+    runs = (FRONTEND / "src" / "api" / "runs.ts").read_text(encoding="utf-8")
+    page = (
+        FRONTEND / "src" / "pages" / "EvaluationWizardPage.tsx"
+    ).read_text(encoding="utf-8")
+
+    assert "task_spec?: Record<string, unknown>" in runs
+    assert "rubric_spec?: Record<string, unknown>" in runs
+    assert "scenario_set?:" in runs
+    assert "task_spec: parseResult.task_spec" in page
+    assert "rubric_spec: rubricResult.rubric_spec" in page
+    assert "scenario_set: confirmedScenarioSet" in page
+    assert "No selected scenarios" in page
+
+
 def test_frontend_has_reusable_evaluation_progress_component():
     component = (
         FRONTEND / "src" / "components" / "evaluation" / "EvaluationProgress.tsx"
